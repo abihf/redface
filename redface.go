@@ -25,7 +25,9 @@ func Enroll(modelFile string) error {
 		recognizer.LoadFile(modelFile)
 	}
 
-	face, err := FindFace(true, func(*gocv.Mat) (bool, error) { return true, nil })
+	face, err := FindFace(true, func(*gocv.Mat) (bool, error) {
+		return true, nil
+	})
 	if err != nil {
 		return err
 	}
@@ -98,13 +100,17 @@ func FindFace(showWindow bool, cb FaceCallback) (*gocv.Mat, error) {
 		// detect faces
 		rects := classifier.DetectMultiScale(mat)
 
-		// draw a rectangle around each face on the original image,
-		// along with text identifying as "Human"
-		for _, r := range rects {
-			gocv.Rectangle(&mat, r, white, 2)
+		var face gocv.Mat
+		if len(rects) == 1 {
+			face = mat.Region(rects[0])
 		}
 
 		if showWindow {
+			// draw a rectangle around each face on the original image,
+			// along with text identifying as "Human"
+			for _, r := range rects {
+				gocv.Rectangle(&mat, r, white, 2)
+			}
 			window.IMShow(mat)
 			if window.WaitKey(1) >= 0 {
 				break
@@ -112,7 +118,6 @@ func FindFace(showWindow bool, cb FaceCallback) (*gocv.Mat, error) {
 		}
 
 		if len(rects) == 1 {
-			face := mat.Region(rects[0])
 			ok, err := cb(&face)
 			if err != nil {
 				return nil, err
@@ -121,6 +126,7 @@ func FindFace(showWindow bool, cb FaceCallback) (*gocv.Mat, error) {
 				return &face, nil
 			}
 		}
+
 	}
 
 	return nil, errors.Errorf("Can not find face")
