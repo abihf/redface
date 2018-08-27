@@ -16,7 +16,7 @@ func main() {
 		must(redface.Enroll(os.Args[2]))
 		println("Done")
 	case "validate":
-		must(redface.Validate(os.Args[2]))
+		must(redface.Validate(os.Args[2], true))
 		println("OK")
 	default:
 		help()

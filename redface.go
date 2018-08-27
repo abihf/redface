@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"os"
+	"time"
 
 	"github.com/blackjack/webcam"
 	"github.com/pkg/errors"
@@ -25,39 +26,52 @@ func Enroll(modelFile string) error {
 		recognizer.LoadFile(modelFile)
 	}
 
-	face, err := FindFace(true, func(*gocv.Mat) (bool, error) {
-		return true, nil
+	timeout := time.Now().Add(3 * time.Second)
+	lastSecond := time.Duration(4)
+	err := FindFace(true, func(face *gocv.Mat) (bool, error) {
+		s := timeout.Sub(time.Now()).Round(time.Second)
+
+		if s < 0 {
+			recognizer.Update([]gocv.Mat{*face}, []int{1})
+			return true, nil
+		} else if s != lastSecond {
+			fmt.Printf("Will take picture in %v...\n", s)
+			lastSecond = s
+		}
+		return false, nil
 	})
 	if err != nil {
 		return err
 	}
 
-	recognizer.Update([]gocv.Mat{*face}, []int{1})
 	recognizer.SaveFile(modelFile)
 	return nil
 }
 
-func Validate(modelFile string) error {
+func Validate(modelFile string, showWindow bool) error {
 	recognizer := contrib.NewLBPHFaceRecognizer()
 	recognizer.LoadFile(modelFile)
 
-	_, err := FindFace(false, func(face *gocv.Mat) (bool, error) {
+	err := FindFace(showWindow, func(face *gocv.Mat) (bool, error) {
 		res := recognizer.PredictExtendedResponse(*face)
+		if showWindow {
+			fmt.Printf("Confidence %v\n", res.Confidence)
+		}
 		return res.Confidence <= 40.0, nil
 	})
 	return err
 }
 
-func FindFace(showWindow bool, cb FaceCallback) (*gocv.Mat, error) {
+func FindFace(showWindow bool, cb FaceCallback) error {
 	cam, err := webcam.Open(infraredDevice)
 	if err != nil {
-		return nil, errors.Wrap(err, "Can not open device ")
+		return errors.Wrap(err, "Can not open device ")
 	}
 	defer cam.Close()
 
 	err = cam.StartStreaming()
 	if err != nil {
-		return nil, errors.Wrap(err, "Can not start streaming")
+		return errors.Wrap(err, "Can not start streaming")
 	}
 
 	// load classifier to recognize faces
@@ -65,7 +79,7 @@ func FindFace(showWindow bool, cb FaceCallback) (*gocv.Mat, error) {
 	defer classifier.Close()
 
 	if !classifier.Load(classifierFile) {
-		return nil, errors.Errorf("Error reading cascade file: %v\n", classifierFile)
+		return errors.Errorf("Error reading cascade file: %v\n", classifierFile)
 	}
 
 	var window *gocv.Window
@@ -84,17 +98,17 @@ func FindFace(showWindow bool, cb FaceCallback) (*gocv.Mat, error) {
 			fmt.Fprint(os.Stderr, err.Error())
 			continue
 		default:
-			return nil, errors.Wrap(err, "Failed when waiting for frame")
+			return errors.Wrap(err, "Failed when waiting for frame")
 		}
 
 		frame, err := cam.ReadFrame()
 		if err != nil {
-			return nil, errors.Wrap(err, "Can not read frame")
+			return errors.Wrap(err, "Can not read frame")
 		}
 
 		mat, err := decodeImage(frame)
 		if err != nil {
-			return nil, errors.Wrap(err, "Can not decode image")
+			return errors.Wrap(err, "Can not decode image")
 		}
 
 		// detect faces
@@ -119,17 +133,19 @@ func FindFace(showWindow bool, cb FaceCallback) (*gocv.Mat, error) {
 
 		if len(rects) == 1 {
 			ok, err := cb(&face)
+			face.Close()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if ok {
-				return &face, nil
+				return nil
 			}
 		}
 
+		mat.Close()
 	}
 
-	return nil, errors.Errorf("Can not find face")
+	return errors.Errorf("Can not find face")
 }
 
 func decodeImage(buf []byte) (gocv.Mat, error) {

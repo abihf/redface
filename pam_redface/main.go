@@ -32,10 +32,12 @@ func (*pamRedface) Authenticate(hdl pam.Handle, args pam.Args) pam.Value {
 		return pamIgnore
 	}
 
+	sendMessage(hdl, "Scanning face...", false)
 	modelFile := fmt.Sprintf("/etc/redface/models/%s.xml", userName)
-	err = redface.Validate(modelFile)
+	err = redface.Validate(modelFile, false)
 	if err != nil {
 		fmt.Printf("Auth failed: %s\n", err.Error())
+		sendMessage(hdl, "Access Denied!", true)
 		return pamIgnore
 	}
 
@@ -44,6 +46,18 @@ func (*pamRedface) Authenticate(hdl pam.Handle, args pam.Args) pam.Value {
 
 func (*pamRedface) SetCredential(hdl pam.Handle, args pam.Args) pam.Value {
 	return pam.Success
+}
+
+func sendMessage(hdl pam.Handle, msg string, isError bool) error {
+	style := pam.MessageTextInfo
+	if isError {
+		style = pam.MessageErrorMsg
+	}
+	_, err := hdl.Conversation(pam.Message{
+		Msg:   msg,
+		Style: style,
+	})
+	return err
 }
 
 var instance pamRedface
