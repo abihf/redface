@@ -2,7 +2,6 @@ package redface
 
 import (
 	"fmt"
-	"image"
 	"image/color"
 	"os"
 	"time"
@@ -69,11 +68,6 @@ func FindFace(showWindow bool, cb FaceCallback) error {
 	}
 	defer cam.Close()
 
-	err = cam.StartStreaming()
-	if err != nil {
-		return errors.Wrap(err, "Can not start streaming")
-	}
-
 	// load classifier to recognize faces
 	classifier := gocv.NewCascadeClassifier()
 	defer classifier.Close()
@@ -86,63 +80,99 @@ func FindFace(showWindow bool, cb FaceCallback) error {
 	if showWindow {
 		window = gocv.NewWindow("Face Detect")
 		defer window.Close()
+
 	}
 
 	white := color.RGBA{255, 255, 255, 0}
 
+	err = cam.StartStreaming()
+	if err != nil {
+		return errors.Wrap(err, "Can not start streaming")
+	}
+
+	mask := gocv.NewMat()
+	defer mask.Close()
+
+	hist := gocv.NewMatWithSize(340, 340, gocv.MatTypeCV8U)
+	defer hist.Close()
+
 	for t := 360; t > 0; t-- {
-		err = cam.WaitForFrame(1000)
-		switch err.(type) {
-		case nil:
-		case *webcam.Timeout:
-			fmt.Fprint(os.Stderr, err.Error())
-			continue
-		default:
-			return errors.Wrap(err, "Failed when waiting for frame")
-		}
-
-		frame, err := cam.ReadFrame()
-		if err != nil {
-			return errors.Wrap(err, "Can not read frame")
-		}
-
-		mat, err := decodeImage(frame)
-		if err != nil {
-			return errors.Wrap(err, "Can not decode image")
-		}
-
-		// detect faces
-		rects := classifier.DetectMultiScale(mat)
-
-		var face gocv.Mat
-		if len(rects) == 1 {
-			face = mat.Region(rects[0])
-		}
-
-		if showWindow {
-			// draw a rectangle around each face on the original image,
-			// along with text identifying as "Human"
-			for _, r := range rects {
-				gocv.Rectangle(&mat, r, white, 2)
+		running, err := func() (bool, error) {
+			err = cam.WaitForFrame(10)
+			switch err.(type) {
+			case nil:
+			case *webcam.Timeout:
+				fmt.Fprint(os.Stderr, err.Error())
+				return true, nil
+			default:
+				return false, errors.Wrap(err, "Failed when waiting for frame")
 			}
-			window.IMShow(mat)
-			if window.WaitKey(1) >= 0 {
-				break
-			}
-		}
 
-		if len(rects) == 1 {
-			ok, err := cb(&face)
-			face.Close()
+			frame, err := cam.ReadFrame()
 			if err != nil {
-				return err
+				return false, errors.Wrap(err, "Can not read frame")
 			}
-			if ok {
-				return nil
-			}
-		}
 
-		mat.Close()
+			mat, err := decodeImage(frame)
+			if err != nil {
+				return false, errors.Wrap(err, "Can not decode image")
+			}
+			defer mat.Close()
+
+			gocv.CalcHist(
+				[]gocv.Mat{mat},
+				[]int{0},
+				mask,
+				&hist,
+				[]int{8},
+				[]float64{0, 256},
+				false,
+			)
+			// i have no idea
+			firstHist := hist.GetFloatAt(0, 0)
+			sumHist := float32(hist.Sum().Val1)
+			if firstHist/sumHist > 0.5 {
+				return true, nil
+			}
+
+			// detect faces
+			rects := classifier.DetectMultiScale(mat)
+
+			var face gocv.Mat
+			if len(rects) == 1 {
+				face = mat.Region(rects[0])
+				defer face.Close()
+			}
+
+			if showWindow {
+				for _, r := range rects {
+					r.Inset(-2)
+					gocv.Rectangle(&mat, r, white, 2)
+				}
+
+				window.IMShow(mat)
+				window.WaitKey(1)
+			}
+
+			if len(rects) == 1 {
+				ok, err := cb(&face)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					return false, nil
+				}
+			}
+
+			return true, nil
+		}()
+
+		if err != nil {
+			return err
+		}
+		if !running {
+			return nil
+		}
 	}
 
 	return errors.Errorf("Can not find face")
@@ -151,11 +181,5 @@ func FindFace(showWindow bool, cb FaceCallback) error {
 func decodeImage(buf []byte) (gocv.Mat, error) {
 	width := 340
 	height := 340
-	img := image.NewGray(image.Rectangle{Max: image.Point{X: 340, Y: 340}})
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			img.SetGray(x, y, color.Gray{Y: uint8(buf[y*width+x])})
-		}
-	}
-	return gocv.ImageGrayToMatGray(img)
+	return gocv.NewMatFromBytes(width, height, gocv.MatTypeCV8UC1, buf)
 }
