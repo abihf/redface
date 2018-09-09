@@ -2,10 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/user"
-
-	"github.com/abihf/redface"
 
 	"github.com/zro/pam"
 )
@@ -27,18 +26,34 @@ func (*pamRedface) Authenticate(hdl pam.Handle, args pam.Args) pam.Value {
 		return pam.UserUnknown
 	}
 
-	keyringFile := fmt.Sprintf("/run/user/%s/keyring/control", u.Uid)
-	if _, err = os.Stat(keyringFile); os.IsNotExist(err) {
+	sockPath := fmt.Sprintf("/run/user/%s/redface/redfaced.sock", u.Uid)
+	if _, err = os.Stat(sockPath); os.IsNotExist(err) {
 		return pamIgnore
 	}
 
-	sendMessage(hdl, "Scanning face...", false)
-	modelFile := fmt.Sprintf("/etc/redface/models/%s.xml", userName)
-	err = redface.Validate(modelFile, false)
+	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
-		fmt.Printf("Auth failed: %s\n", err.Error())
-		sendMessage(hdl, "Access Denied!", true)
 		return pamIgnore
+	}
+	defer conn.Close()
+
+	sendMessage(hdl, "Scanning face...", false)
+	_, err = fmt.Fprint(conn, "AUTH pam")
+	if err != nil {
+		sendMessage(hdl, "Daemon error", true)
+		return pam.CredentialUnavailable
+	}
+
+	buff := make([]byte, 1024)
+	nr, err := conn.Read(buff)
+	if err != nil {
+		sendMessage(hdl, "Daemon error", true)
+		return pam.CredentialUnavailable
+	}
+	data := string(buff[:nr])
+	if data != "SUCCESS" {
+		sendMessage(hdl, data, true)
+		return pam.CredentialError
 	}
 
 	return pam.Success

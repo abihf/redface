@@ -1,185 +1,99 @@
 package redface
 
 import (
+	"encoding/json"
 	"fmt"
-	"image/color"
+	"math"
 	"os"
 	"time"
 
-	"github.com/blackjack/webcam"
-	"github.com/pkg/errors"
-	"gocv.io/x/gocv"
-	"gocv.io/x/gocv/contrib"
+	"github.com/abihf/redface/capture"
+	"github.com/abihf/redface/facerec"
 )
 
 const (
 	infraredDevice = "/dev/video2"
-	classifierFile = "/usr/share/opencv/haarcascades/haarcascade_frontalface_alt.xml"
+	dataDir        = "/usr/share/redface"
 )
 
-type FaceCallback func(*gocv.Mat) (bool, error)
-
-func Enroll(modelFile string) error {
-	recognizer := contrib.NewLBPHFaceRecognizer()
-	if _, err := os.Stat(modelFile); !os.IsNotExist(err) {
-		recognizer.LoadFile(modelFile)
-	}
-
-	timeout := time.Now().Add(3 * time.Second)
-	lastSecond := time.Duration(4)
-	err := FindFace(true, func(face *gocv.Mat) (bool, error) {
-		s := timeout.Sub(time.Now()).Round(time.Second)
-
-		if s < 0 {
-			recognizer.Update([]gocv.Mat{*face}, []int{1})
-			return true, nil
-		} else if s != lastSecond {
-			fmt.Printf("Will take picture in %v...\n", s)
-			lastSecond = s
-		}
-		return false, nil
-	})
-	if err != nil {
-		return err
-	}
-
-	recognizer.SaveFile(modelFile)
-	return nil
+type VerifyOption struct {
+	ModelFile string
+	Timeout   time.Duration
+	Threshold float64
 }
 
-func Validate(modelFile string, showWindow bool) error {
-	recognizer := contrib.NewLBPHFaceRecognizer()
-	recognizer.LoadFile(modelFile)
+func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
+	models, err := readModels(opt.ModelFile)
+	if err != nil {
+		return false, err
+	}
 
-	err := FindFace(showWindow, func(face *gocv.Mat) (bool, error) {
-		res := recognizer.PredictExtendedResponse(*face)
-		if showWindow {
-			fmt.Printf("Confidence %v\n", res.Confidence)
+	result := false
+
+	var timeout time.Time
+	if opt.Timeout > 0 {
+		timeout = time.Now().Add(opt.Timeout)
+	}
+
+	capOption := &capture.Option{
+		Device: infraredDevice,
+	}
+	err = capture.Capture(capOption, func(gray []byte, width, height int) (bool, error) {
+		if opt.Timeout > 0 && time.Now().Sub(timeout) >= 0 {
+			return false, fmt.Errorf("Timeout %v", opt.Timeout)
 		}
-		return res.Confidence <= 40.0, nil
-	})
-	return err
-}
 
-func FindFace(showWindow bool, cb FaceCallback) error {
-	cam, err := webcam.Open(infraredDevice)
-	if err != nil {
-		return errors.Wrap(err, "Can not open device ")
-	}
-	defer cam.Close()
-
-	// load classifier to recognize faces
-	classifier := gocv.NewCascadeClassifier()
-	defer classifier.Close()
-
-	if !classifier.Load(classifierFile) {
-		return errors.Errorf("Error reading cascade file: %v\n", classifierFile)
-	}
-
-	var window *gocv.Window
-	if showWindow {
-		window = gocv.NewWindow("Face Detect")
-		defer window.Close()
-
-	}
-
-	white := color.RGBA{255, 255, 255, 0}
-
-	err = cam.StartStreaming()
-	if err != nil {
-		return errors.Wrap(err, "Can not start streaming")
-	}
-
-	mask := gocv.NewMat()
-	defer mask.Close()
-
-	hist := gocv.NewMatWithSize(340, 340, gocv.MatTypeCV8U)
-	defer hist.Close()
-
-	for t := 360; t > 0; t-- {
-		running, err := func() (bool, error) {
-			err = cam.WaitForFrame(10)
-			switch err.(type) {
-			case nil:
-			case *webcam.Timeout:
-				fmt.Fprint(os.Stderr, err.Error())
-				return true, nil
-			default:
-				return false, errors.Wrap(err, "Failed when waiting for frame")
-			}
-
-			frame, err := cam.ReadFrame()
-			if err != nil {
-				return false, errors.Wrap(err, "Can not read frame")
-			}
-
-			mat, err := decodeImage(frame)
-			if err != nil {
-				return false, errors.Wrap(err, "Can not decode image")
-			}
-			defer mat.Close()
-
-			gocv.CalcHist(
-				[]gocv.Mat{mat},
-				[]int{0},
-				mask,
-				&hist,
-				[]int{8},
-				[]float64{0, 256},
-				false,
-			)
-			// i have no idea
-			firstHist := hist.GetFloatAt(0, 0)
-			sumHist := float32(hist.Sum().Val1)
-			if firstHist/sumHist > 0.5 {
-				return true, nil
-			}
-
-			// detect faces
-			rects := classifier.DetectMultiScale(mat)
-
-			var face gocv.Mat
-			if len(rects) == 1 {
-				face = mat.Region(rects[0])
-				defer face.Close()
-			}
-
-			if showWindow {
-				for _, r := range rects {
-					r.Inset(-2)
-					gocv.Rectangle(&mat, r, white, 2)
-				}
-
-				window.IMShow(mat)
-				window.WaitKey(1)
-			}
-
-			if len(rects) == 1 {
-				ok, err := cb(&face)
-				if err != nil {
-					return false, err
-				}
-				if ok {
-					return false, nil
-				}
-			}
-
-			return true, nil
-		}()
-
+		rgb := grayToRGB(gray)
+		faces, err := rec.Recognize(rgb, width, height, 0)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if !running {
-			return nil
+
+		distance := math.MaxFloat64
+		for _, face := range faces {
+			for _, model := range models {
+				d := facerec.GetDistance(model, face.Descriptor)
+				if d < distance {
+					distance = d
+				}
+			}
 		}
+
+		fmt.Printf("min distance %v\n", distance)
+
+		if distance > 0 && distance < opt.Threshold {
+			result = true
+			return false, nil
+		}
+
+		return true, nil
+	})
+	if err != nil {
+		return false, err
 	}
 
-	return errors.Errorf("Can not find face")
+	return result, nil
 }
 
-func decodeImage(buf []byte) (gocv.Mat, error) {
-	width := 340
-	height := 340
-	return gocv.NewMatFromBytes(width, height, gocv.MatTypeCV8UC1, buf)
+func readModels(file string) ([]facerec.Descriptor, error) {
+	var res []facerec.Descriptor
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	err = json.NewDecoder(f).Decode(&res)
+	return res, err
+}
+
+func grayToRGB(gray []byte) []byte {
+	rgb := make([]byte, len(gray)*3)
+	for i := 0; i < len(gray); i++ {
+		offset := i * 3
+		rgb[offset+0] = gray[i]
+		rgb[offset+1] = gray[i]
+		rgb[offset+2] = gray[i]
+	}
+	return rgb
 }

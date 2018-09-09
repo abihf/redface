@@ -25,10 +25,6 @@
 #   unused-packages = true
 
 
-[[constraint]]
-  name = "gocv.io/x/gocv"
-  version = "0.15.0"
-
 [prune]
   go-tests = true
   unused-packages = true
