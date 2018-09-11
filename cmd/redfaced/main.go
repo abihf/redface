@@ -1,22 +1,20 @@
 package main
 
 import (
-	"strings"
-	"time"
-
-	"github.com/abihf/redface"
-
-	"github.com/abihf/redface/facerec"
-	"github.com/pkg/errors"
-
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"os/user"
-	"path"
+	"strconv"
 	"syscall"
+	"time"
+
+	"github.com/abihf/redface"
+	"github.com/abihf/redface/facerec"
+	"github.com/abihf/redface/protocol"
+	"github.com/pkg/errors"
 )
 
 const dataDir = "/usr/share/redface"
@@ -30,17 +28,9 @@ func main() {
 }
 
 func serve() error {
-	currentUser, err := user.Current()
-	if err != nil {
-		return errors.Wrap(err, "Can not get current user")
-	}
-
-	baseDir := fmt.Sprintf("/run/user/%s/redface", currentUser.Uid)
-	modelFile = fmt.Sprintf("/etc/redface/models/%s.json", currentUser.Uid)
-
-	procPath := path.Join(baseDir, "redfaced.pid")
-	if _, err = os.Stat(procPath); !os.IsNotExist(err) {
-		return errors.Errorf("%s already exist", procPath)
+	procPath := protocol.GetLockFile()
+	if isAlreadyRun(procPath) {
+		return errors.New("already run")
 	}
 
 	recognizer, err := facerec.NewRecognizer(dataDir)
@@ -48,11 +38,11 @@ func serve() error {
 		return errors.Wrap(err, "Can not initialize face recognizer")
 	}
 
-	os.MkdirAll(baseDir, 0700)
+	// os.MkdirAll(baseDir, 0700)
 	writeLockFile(procPath)
 	defer os.Remove(procPath)
 
-	sockPath := path.Join(baseDir, "redfaced.sock")
+	sockPath := protocol.GetSockAddress() // path.Join(baseDir, "redfaced.sock")
 	os.Remove(sockPath)
 
 	log.Println("Starting echo server")
@@ -62,7 +52,7 @@ func serve() error {
 	}
 	defer ln.Close()
 
-	os.Chmod(sockPath, 0600)
+	os.Chmod(sockPath, 0666)
 
 	go func() {
 		for {
@@ -90,6 +80,72 @@ func serve() error {
 	return nil
 }
 
+func handle(rec *facerec.Recognizer, c net.Conn) {
+	defer c.Close()
+
+	for {
+		req, err := protocol.ReadReq(c)
+		if err != nil {
+			if err.Error() != "EOF" {
+				log.Println("Can not read request", err)
+			}
+			return
+		}
+
+		switch req.Action {
+		case protocol.ActionAuthenticate:
+			authReq := protocol.ToAuthReq(req)
+			log.Printf("Authorizing %s\n", authReq.User)
+
+			file := fmt.Sprintf("/etc/redface/models/%s.json", authReq.User)
+			success, err := redface.Verify(rec, &redface.VerifyOption{
+				ModelFile: file,
+				Timeout:   5 * time.Second,
+				Threshold: 0.12,
+			})
+			if err == nil && !success {
+				err = errors.New("Access denied")
+			}
+
+			if err != nil {
+				protocol.WriteErrorRes(c, err)
+			} else {
+				protocol.WriteSuccessRes(c, nil)
+			}
+		}
+	}
+}
+
+func isAlreadyRun(path string) bool {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return false
+	}
+
+	pidStr, err := ioutil.ReadFile(path)
+	if err != nil {
+		log.Println("Can not read pid file", err)
+		return false
+	}
+	pid, err := strconv.Atoi(string(pidStr))
+	if err != nil {
+		log.Println("Invalid existing pid file", err)
+		return false
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		log.Println("Can not find current process", err)
+		return false
+	}
+
+	err = proc.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+
+	return false
+}
+
 func writeLockFile(path string) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -98,35 +154,4 @@ func writeLockFile(path string) error {
 
 	fmt.Fprintf(f, "%d", os.Getpid())
 	return f.Close()
-}
-
-func handle(rec *facerec.Recognizer, c net.Conn) {
-	defer c.Close()
-
-	buf := make([]byte, 512)
-	nr, err := c.Read(buf)
-	if err != nil {
-		return
-	}
-
-	data := string(buf[0:nr])
-	if strings.HasPrefix(data, "AUTH ") {
-		println(data)
-		success, err := redface.Verify(rec, &redface.VerifyOption{
-			ModelFile: modelFile,
-			Timeout:   10 * time.Second,
-			Threshold: 0.12,
-		})
-		if err != nil {
-			fmt.Fprintf(c, "Error: %v", err)
-			return
-		}
-		if !success {
-			fmt.Fprint(c, "Access Denied")
-			return
-		}
-		fmt.Fprint(c, "SUCCESS")
-		return
-	}
-	fmt.Fprintf(c, "Invalid command")
 }

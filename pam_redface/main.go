@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
 	"os/user"
+	"text/template"
 
+	"github.com/abihf/redface/protocol"
 	"github.com/zro/pam"
 )
 
@@ -14,6 +17,11 @@ const pamIgnore pam.Value = 25
 type pamRedface struct{}
 
 func (*pamRedface) Authenticate(hdl pam.Handle, args pam.Args) pam.Value {
+	sockPath := protocol.GetSockAddress()
+	if _, err := os.Stat(sockPath); os.IsNotExist(err) {
+		return pamIgnore
+	}
+
 	userName, err := hdl.GetUser()
 	if err != nil {
 		fmt.Printf("Can not get user: %s\n", err.Error())
@@ -26,33 +34,46 @@ func (*pamRedface) Authenticate(hdl pam.Handle, args pam.Args) pam.Value {
 		return pam.UserUnknown
 	}
 
-	sockPath := fmt.Sprintf("/run/user/%s/redface/redfaced.sock", u.Uid)
-	if _, err = os.Stat(sockPath); os.IsNotExist(err) {
-		return pamIgnore
+	if conditionalFileTemplate, ok := args["ifexist"]; ok {
+
+		conditionalFile, err := executeTemplate(conditionalFileTemplate, u)
+		if err != nil {
+			fmt.Printf("Can not parse conditional file: %s\n", err.Error())
+			return pam.AuthError
+		}
+
+		if _, err = os.Stat(conditionalFile); os.IsNotExist(err) {
+			return pamIgnore
+		}
 	}
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
-		return pamIgnore
+		return pam.CredentialUnavailable
 	}
 	defer conn.Close()
 
 	sendMessage(hdl, "Scanning face...", false)
-	_, err = fmt.Fprint(conn, "AUTH pam")
+
+	clientName, ok := args["client"]
+	if !ok {
+		clientName = "pam"
+	}
+
+	err = protocol.WriteAuthReq(conn, u.Uid, clientName)
 	if err != nil {
 		sendMessage(hdl, "Daemon error", true)
 		return pam.CredentialUnavailable
 	}
 
-	buff := make([]byte, 1024)
-	nr, err := conn.Read(buff)
+	res, err := protocol.ReadRes(conn)
 	if err != nil {
 		sendMessage(hdl, "Daemon error", true)
 		return pam.CredentialUnavailable
 	}
-	data := string(buff[:nr])
-	if data != "SUCCESS" {
-		sendMessage(hdl, data, true)
+
+	if res.Status != protocol.StatusSuccess {
+		sendMessage(hdl, res.Error, true)
 		return pam.CredentialError
 	}
 
@@ -73,6 +94,21 @@ func sendMessage(hdl pam.Handle, msg string, isError bool) error {
 		Style: style,
 	})
 	return err
+}
+
+func executeTemplate(tplString string, data interface{}) (string, error) {
+	tpl, err := template.New("conditional").Parse(tplString)
+	if err != nil {
+		return "", err
+	}
+
+	var buf bytes.Buffer
+	err = tpl.Execute(&buf, data)
+	if err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
 }
 
 var instance pamRedface

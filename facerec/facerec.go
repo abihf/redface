@@ -1,7 +1,7 @@
 package facerec
 
 // #cgo pkg-config: dlib-1
-// #cgo CXXFLAGS: -std=c++1z -Wall -O2 -DNDEBUG -march=native
+// #cgo CXXFLAGS: -std=c++1z -Wall -DNDEBUG -O3 -march=native
 // #include <stdlib.h>
 // #include <stdint.h>
 // #include "facerec.h"

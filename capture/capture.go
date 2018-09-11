@@ -3,6 +3,7 @@ package capture
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	"github.com/blackjack/webcam"
 	"github.com/pkg/errors"
@@ -29,11 +30,19 @@ func Capture(opt *Option, processor Processor) error {
 	frameChan := make(chan []byte)
 	var captureError error
 
+	var captureDone atomic.Value
+	captureDone.Store(false)
+	defer captureDone.Store(false)
+
 	go func() {
 		defer close(frameChan)
 
 		for {
-			err = cam.WaitForFrame(10)
+			if captureDone.Load().(bool) {
+				break
+			}
+
+			err = cam.WaitForFrame(1)
 			switch err.(type) {
 			case nil:
 			case *webcam.Timeout:
@@ -42,6 +51,10 @@ func Capture(opt *Option, processor Processor) error {
 			default:
 				captureError = err
 				return
+			}
+
+			if captureDone.Load().(bool) {
+				break
 			}
 
 			frame, err := cam.ReadFrame()
@@ -66,6 +79,10 @@ func Capture(opt *Option, processor Processor) error {
 		frame := <-frameChan
 		if captureError != nil {
 			return captureError
+		}
+
+		if frame == nil {
+			break
 		}
 
 		cont, err := processor(frame, 340, 340)
