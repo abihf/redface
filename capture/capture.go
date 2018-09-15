@@ -63,6 +63,10 @@ func Capture(opt *Option, processor Processor) error {
 				return
 			}
 
+			if captureDone.Load().(bool) {
+				break
+			}
+
 			if len(frameChan) > 0 {
 				continue
 			}
