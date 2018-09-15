@@ -1,28 +1,54 @@
-build: pam util
+DESTDIR = ""
+PREFIX = "/usr"
+BINDIR = $(PREFIX)/bin
+LIBDIR = $(PREFIX)/lib
+DATADIR = $(PREFIX)/share
 
-daemon: build/redfaced
-util: build/redface
-pam: build/pam_redface.so
+BUILD_DIR = "./build"
 
-build/pam_redface.so:
+#----------------------------------------------------------------------------------------
+# INSTALL
+#----------------------------------------------------------------------------------------
+
+build: pam util daemon
+
+daemon: $(BUILD_DIR)/redfaced
+util: $(BUILD_DIR)/redface
+pam: $(BUILD_DIR)/pam_redface.so
+
+$(BUILD_DIR)/pam_redface.so:
 	go build -v -buildmode=c-shared -o build/pam_redface.so pam_redface/main.go
 
-build/redface:
+$(BUILD_DIR)/redface:
 	go build -v -o build/redface cmd/redface/main.go
 
-build/redfaced:
+$(BUILD_DIR)/redfaced:
 	go build -v -o build/redfaced cmd/redfaced/main.go
 
-install: install-pam install-util install-daemon
+#----------------------------------------------------------------------------------------
+# INSTALL
+#----------------------------------------------------------------------------------------
+
+install: install-pam install-util install-daemon install-data 
 
 install-pam: pam
-	@cp build/pam_redface.so /lib/security/pam_redface.so
+	install $(BUILD_DIR)/pam_redface.so $(DESTDIR)$(LIBDIR)/security/pam_redface.so
 
 install-util: util
-	@cp build/redface /usr/bin/redface
+	install $(BUILD_DIR)/redface $(DESTDIR)$(BINDIR)/redface
 
 install-daemon: daemon
-	@cp build/redfaced /usr/bin/redfaced
+	install $(BUILD_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
+	install data/redfaced.service $(DESTDIR)$(LIBDIR)/systemd/system/redfaced.service
+
+install-data:
+	install -d -m 700 $(DESTDIR)$(DATADIR)/redface
+	install data/dlib_face_recognition_resnet_model_v1.dat $(DESTDIR)$(DATADIR)/redface/dlib_face_recognition_resnet_model_v1.dat
+	install data/shape_predictor_5_face_landmarks.dat $(DESTDIR)$(DATADIR)/redface/shape_predictor_5_face_landmarks.dat
+
+#----------------------------------------------------------------------------------------
+# CLEAN
+#----------------------------------------------------------------------------------------
 
 clean:
 	rm -f build/pam_redface.so

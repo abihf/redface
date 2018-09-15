@@ -1,0 +1,18 @@
+# redfaced - systemd startup/shutdown service
+#
+# Copyright (c) 2018 Abi Hafshin <abi at hafs.in>
+# This software is licensed under MIT.
+
+[Unit]
+Description=Redface Auth Daemon
+After=multi-user.target 
+Before=shutdown.target
+Documentation=https://github.com/abihf/redface
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/redfaced
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target
