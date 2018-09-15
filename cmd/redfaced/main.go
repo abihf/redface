@@ -19,8 +19,6 @@ import (
 
 const dataDir = "/usr/share/redface"
 
-var modelFile string
-
 func main() {
 	if err := serve(); err != nil {
 		log.Fatal(err)
@@ -38,14 +36,12 @@ func serve() error {
 		return errors.Wrap(err, "Can not initialize face recognizer")
 	}
 
-	// os.MkdirAll(baseDir, 0700)
 	writeLockFile(procPath)
 	defer os.Remove(procPath)
 
-	sockPath := protocol.GetSockAddress() // path.Join(baseDir, "redfaced.sock")
+	sockPath := protocol.GetSockAddress()
 	os.Remove(sockPath)
 
-	log.Println("Starting echo server")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return errors.Wrap(err, "Listen error")
