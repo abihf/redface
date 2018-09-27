@@ -7,7 +7,7 @@ This is my work-in-progress project to enable face recognition based pam authent
 [Wiki](https://github.com/abihf/redface/wiki)
 
 ## Reference
-http://dlib.net/dnn_face_recognition_ex.cpp.html
-https://github.com/ageitgey/face_recognition
-https://github.com/Kagami/go-face
-https://github.com/boltgolt/howdy
+* https://github.com/boltgolt/howdy
+* http://dlib.net/dnn_face_recognition_ex.cpp.html
+* https://github.com/Kagami/go-face
+* https://github.com/ageitgey/face_recognition
