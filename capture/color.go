@@ -8,6 +8,6 @@ func hasGoodBlackLevel(img []byte) bool {
 			dark++
 		}
 	}
-	darkness := float64(dark) / float64(total)
-	return darkness > 0.1 && darkness < 0.7
+	darkness := 100 * dark / total
+	return darkness > 10 && darkness < 90
 }

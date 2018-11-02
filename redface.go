@@ -49,6 +49,10 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 			return false, err
 		}
 
+		if len(faces) == 0 {
+			return true, nil
+		}
+
 		distance := math.MaxFloat64
 		for _, face := range faces {
 			for _, model := range models {

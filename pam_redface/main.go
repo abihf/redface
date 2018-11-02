@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/user"
+	"syscall"
 	"text/template"
 
 	"github.com/abihf/redface/protocol"
@@ -18,8 +19,22 @@ type pamRedface struct{}
 
 func (*pamRedface) Authenticate(hdl pam.Handle, args pam.Args) pam.Value {
 	sockPath := protocol.GetSockAddress()
-	if _, err := os.Stat(sockPath); os.IsNotExist(err) {
+	sockStat, err := os.Stat(sockPath)
+	if os.IsNotExist(err) {
 		return pamIgnore
+	}
+	if err != nil {
+		fmt.Printf("Sock file error %v\n", err.Error())
+		return pam.AuthError
+	}
+	uStat, ok := sockStat.Sys().(*syscall.Stat_t)
+	if !ok {
+		fmt.Printf("Invalid sock file state")
+		return pam.AuthError
+	}
+	if uStat.Uid != 0 {
+		fmt.Printf("Invalid sock file owner")
+		return pam.AuthError
 	}
 
 	userName, err := hdl.GetUser()

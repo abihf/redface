@@ -10,17 +10,13 @@ BUILD_DIR = "./build"
 # INSTALL
 #----------------------------------------------------------------------------------------
 
-build: pam util daemon
+build: pam daemon
 
 daemon: $(BUILD_DIR)/redfaced
-util: $(BUILD_DIR)/redface
 pam: $(BUILD_DIR)/pam_redface.so
 
 $(BUILD_DIR)/pam_redface.so:
 	go build -v -buildmode=c-shared -o build/pam_redface.so pam_redface/main.go
-
-$(BUILD_DIR)/redface:
-	go build -v -o build/redface cmd/redface/main.go
 
 $(BUILD_DIR)/redfaced:
 	go build -v -o build/redfaced cmd/redfaced/main.go
@@ -29,13 +25,10 @@ $(BUILD_DIR)/redfaced:
 # INSTALL
 #----------------------------------------------------------------------------------------
 
-install: install-pam install-util install-daemon install-data 
+install: install-pam install-daemon install-data 
 
 install-pam: pam
 	install $(BUILD_DIR)/pam_redface.so $(DESTDIR)$(LIBDIR)/security/pam_redface.so
-
-install-util: util
-	install $(BUILD_DIR)/redface $(DESTDIR)$(BINDIR)/redface
 
 install-daemon: daemon
 	install $(BUILD_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
@@ -52,5 +45,4 @@ install-data:
 
 clean:
 	rm -f build/pam_redface.so
-	rm -f build/redface
 	rm -f build/redfaced
