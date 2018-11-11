@@ -1,25 +1,28 @@
-DESTDIR = ""
-PREFIX = "/usr"
+DESTDIR = 
+PREFIX = /usr
 BINDIR = $(PREFIX)/bin
 LIBDIR = $(PREFIX)/lib
 DATADIR = $(PREFIX)/share
+PAMDIR = $(LIBDIR)/security
 
-BUILD_DIR = "./build"
+BUILD_DIR = ./build
 
 #----------------------------------------------------------------------------------------
-# INSTALL
+# BUILD
 #----------------------------------------------------------------------------------------
+
+GOFILES = $(wildcard *.go)
 
 build: pam daemon
 
 daemon: $(BUILD_DIR)/redfaced
 pam: $(BUILD_DIR)/pam_redface.so
 
-$(BUILD_DIR)/pam_redface.so:
-	go build -v -buildmode=c-shared -o build/pam_redface.so pam_redface/main.go
+$(BUILD_DIR)/pam_redface.so: $(GOFILES)
+	go build -v -buildmode=c-shared -o $@ ./pam_redface/main.go
 
-$(BUILD_DIR)/redfaced:
-	go build -v -o build/redfaced cmd/redfaced/main.go
+$(BUILD_DIR)/redfaced: $(GOFILES)
+	go build -v -o $@ ./cmd/redfaced/main.go
 
 #----------------------------------------------------------------------------------------
 # INSTALL
@@ -28,7 +31,7 @@ $(BUILD_DIR)/redfaced:
 install: install-pam install-daemon install-data 
 
 install-pam: pam
-	install $(BUILD_DIR)/pam_redface.so $(DESTDIR)$(LIBDIR)/security/pam_redface.so
+	install $(BUILD_DIR)/pam_redface.so $(DESTDIR)$(PAMDIR)/pam_redface.so
 
 install-daemon: daemon
 	install $(BUILD_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
