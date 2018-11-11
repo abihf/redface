@@ -38,6 +38,7 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 	capOption := &capture.Option{
 		Device: infraredDevice,
 	}
+	noFaceFrames := 0
 	err = capture.Capture(capOption, func(gray []byte, width, height int) (bool, error) {
 		if opt.Timeout > 0 && time.Now().Sub(timeout) >= 0 {
 			return false, fmt.Errorf("Timeout %v", opt.Timeout)
@@ -50,20 +51,22 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 		}
 
 		if len(faces) == 0 {
+			noFaceFrames++
 			return true, nil
 		}
 
 		distance := math.MaxFloat64
-		for _, face := range faces {
+		for i, face := range faces {
+			fmt.Printf("Face [%d]:", i)
 			for _, model := range models {
 				d := facerec.GetDistance(model, face.Descriptor)
+				fmt.Printf(" %.3f", d)
 				if d < distance {
 					distance = d
 				}
 			}
+			println()
 		}
-
-		fmt.Printf("min distance %v\n", distance)
 
 		if distance > 0 && distance < opt.Threshold {
 			result = true
@@ -72,6 +75,7 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 
 		return true, nil
 	})
+	fmt.Printf("Frames without face found: %d\n", noFaceFrames)
 	if err != nil {
 		return false, err
 	}
