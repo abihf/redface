@@ -10,16 +10,25 @@ import (
 )
 
 type camBuffer struct {
-	frame    chan []byte
+	frame    chan *Frame
 	stopChan chan bool
 	err      error
 
 	stopped atomic.Value
 }
 
+type Frame struct {
+	Buffer []byte
+	Width  int
+	Height int
+
+	cam   *webcam.Webcam
+	index uint32
+}
+
 func newCamBuffer() *camBuffer {
 	c := &camBuffer{
-		frame:    make(chan []byte, 1),
+		frame:    make(chan *Frame, 1),
 		stopChan: make(chan bool, 1),
 		err:      nil,
 	}
@@ -50,7 +59,7 @@ func (c *camBuffer) _start(device string) error {
 	}
 
 	for {
-		if c.isRunning() {
+		if c.isStopped() {
 			break
 		}
 
@@ -64,37 +73,45 @@ func (c *camBuffer) _start(device string) error {
 			return errors.Wrap(err, "Frame wait failed")
 		}
 
-		if c.isRunning() {
+		if c.isStopped() {
 			break
 		}
 
-		frame, err := cam.ReadFrame()
+		frame, frameIndex, err := cam.GetFrame()
 		if err != nil {
+			cam.ReleaseFrame(frameIndex)
 			return errors.Wrap(err, "Read frame failed")
 		}
 
-		if c.isRunning() {
+		if c.isStopped() {
 			break
 		}
 
-		if len(c.frame) > 0 {
+		if len(c.frame) > 0 || !hasGoodBlackLevel(frame) {
+			cam.ReleaseFrame(frameIndex)
 			continue
 		}
 
-		if !hasGoodBlackLevel(frame) {
-			continue
+		c.frame <- &Frame{
+			Buffer: frame,
+			Width:  340,
+			Height: 340,
+			cam:    cam,
+			index:  frameIndex,
 		}
-
-		c.frame <- frame
 	}
 
 	return nil
 }
 
-func (c *camBuffer) isRunning() bool {
+func (c *camBuffer) isStopped() bool {
 	return c.stopped.Load().(bool)
 }
 
 func (c *camBuffer) stop() {
 	c.stopped.Store(true)
+}
+
+func (f *Frame) Free() {
+	f.cam.ReleaseFrame(f.index)
 }

@@ -39,13 +39,14 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 		Device: infraredDevice,
 	}
 	noFaceFrames := 0
-	err = capture.Capture(capOption, func(gray []byte, width, height int) (bool, error) {
+	err = capture.Capture(capOption, func(frame *capture.Frame) (bool, error) {
 		if opt.Timeout > 0 && time.Now().Sub(timeout) >= 0 {
 			return false, fmt.Errorf("Timeout %v", opt.Timeout)
 		}
 
-		rgb := grayToRGB(gray)
-		faces, err := rec.Recognize(rgb, width, height, 0)
+		rgb := grayToRGB(frame.Buffer)
+		frame.Free()
+		faces, err := rec.Recognize(rgb, frame.Width, frame.Height, 0)
 		if err != nil {
 			return false, err
 		}
@@ -68,7 +69,7 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 			println()
 		}
 
-		if distance > 0 && distance < opt.Threshold {
+		if distance < opt.Threshold {
 			result = true
 			return false, nil
 		}

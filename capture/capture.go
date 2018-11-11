@@ -1,6 +1,6 @@
 package capture
 
-type Processor func(img []byte, width, height int) (bool, error)
+type Processor func(frame *Frame) (bool, error)
 
 type Option struct {
 	Device string
@@ -17,7 +17,7 @@ func Capture(opt *Option, processor Processor) error {
 			return cam.err
 
 		case frame := <-cam.frame:
-			cont, err := processor(frame, 340, 340)
+			cont, err := processor(frame)
 			if err != nil {
 				return err
 			}
