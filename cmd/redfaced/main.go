@@ -96,7 +96,7 @@ func handle(rec *facerec.Recognizer, c net.Conn) {
 			file := fmt.Sprintf("/etc/redface/models/%s.json", authReq.User)
 			success, err := redface.Verify(rec, &redface.VerifyOption{
 				ModelFile: file,
-				Timeout:   5 * time.Second,
+				Timeout:   10 * time.Second,
 				Threshold: 0.12,
 			})
 			if err == nil && !success {
