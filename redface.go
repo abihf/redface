@@ -46,7 +46,10 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 
 		rgb := grayToRGB(frame.Buffer)
 		frame.Free()
+		recStart := time.Now()
 		faces, err := rec.Recognize(rgb, frame.Width, frame.Height, 0)
+		recDuration := time.Now().Sub(recStart)
+
 		if err != nil {
 			return false, err
 		}
@@ -55,10 +58,11 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 			noFaceFrames++
 			return true, nil
 		}
+		fmt.Printf("* Found %d faces in %v\n", len(faces), recDuration)
 
 		distance := math.MaxFloat64
 		for i, face := range faces {
-			fmt.Printf("Face [%d]:", i)
+			fmt.Printf("  - Face [%d]:", i)
 			for _, model := range models {
 				d := facerec.GetDistance(model, face.Descriptor)
 				fmt.Printf(" %.3f", d)
@@ -76,7 +80,10 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 
 		return true, nil
 	})
-	fmt.Printf("Frames without face found: %d\n", noFaceFrames)
+	if noFaceFrames > 0 {
+		fmt.Printf("> Frames without face found: %d\n\n", noFaceFrames)
+	}
+
 	if err != nil {
 		return false, err
 	}
