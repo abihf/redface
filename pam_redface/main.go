@@ -10,7 +10,7 @@ import (
 	"text/template"
 
 	"github.com/abihf/redface/protocol"
-	"github.com/zro/pam"
+	"github.com/donpark/pam"
 )
 
 const pamIgnore pam.Value = 25
