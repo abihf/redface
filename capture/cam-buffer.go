@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -26,6 +27,10 @@ type Frame struct {
 	index uint32
 }
 
+func (frame *Frame) Close() {
+	frame.cam.ReleaseFrame(frame.index)
+}
+
 func newCamBuffer() *camBuffer {
 	c := &camBuffer{
 		frame:    make(chan *Frame, 1),
@@ -34,6 +39,61 @@ func newCamBuffer() *camBuffer {
 	}
 	c.stopped.Store(false)
 	return c
+}
+
+type captureConfig struct {
+	Device         string
+	SkipBlackImage bool
+}
+
+func captureNew(ctx context.Context, conf *captureConfig, frameChan chan *Frame) error {
+	cam, err := webcam.Open(conf.Device)
+	if err != nil {
+		return errors.Wrap(err, "Can not open device ")
+	}
+	defer cam.Close()
+
+	err = cam.StartStreaming()
+	if err != nil {
+		return errors.Wrap(err, "Can not start streaming")
+	}
+	defer cam.StopStreaming()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			err = cam.WaitForFrame(1)
+			switch err.(type) {
+			case nil:
+			case *webcam.Timeout:
+				fmt.Fprint(os.Stderr, err.Error())
+				continue
+			default:
+				return errors.Wrap(err, "Frame wait failed")
+			}
+
+			frame, frameIndex, err := cam.GetFrame()
+			if err != nil {
+				cam.ReleaseFrame(frameIndex)
+				return errors.Wrap(err, "Read frame failed")
+			}
+
+			if len(frameChan) >= cap(frameChan) || (conf.SkipBlackImage && !hasGoodBlackLevel(frame)) {
+				cam.ReleaseFrame(frameIndex)
+				continue
+			}
+
+			frameChan <- &Frame{
+				Buffer: frame,
+				Width:  340,
+				Height: 340,
+				cam:    cam,
+				index:  frameIndex,
+			}
+		}
+	}
 }
 
 func (c *camBuffer) start(device string) {

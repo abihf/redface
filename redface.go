@@ -22,7 +22,7 @@ type VerifyOption struct {
 	Threshold float64
 }
 
-func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
+func Verify(recs []*facerec.Recognizer, opt *VerifyOption) (bool, error) {
 	models, err := readModels(opt.ModelFile)
 	if err != nil {
 		return false, err
