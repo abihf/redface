@@ -1,0 +1,48 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'redface'",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=redface",
+          "--package=redface"
+        ],
+        "filter": {
+          "name": "redface",
+          "kind": "bin"
+        },
+      },
+      "env": {
+        "RUST_BACKTRACE": "1",
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'redface'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--bin=redface",
+          "--package=redface"
+        ],
+        "filter": {
+          "name": "redface",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
