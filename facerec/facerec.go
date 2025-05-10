@@ -59,7 +59,7 @@ func NewRecognizer(modelDir string) (rec *Recognizer, err error) {
 // left to right. Empty list is returned if there are no faces, error is
 // returned if there was some error while decoding/processing image.
 // Only JPEG format is currently supported. Thread-safe.
-func (rec *Recognizer) Recognize(imgData []byte, width, height int, maxFaces int) (faces []Face, err error) {
+func (rec *Recognizer) Recognize(imgData []byte, width, height uint32, maxFaces int) (faces []Face, err error) {
 	cImgData := (*C.uint8_t)(&imgData[0])
 	cMaxFaces := C.int(maxFaces)
 	cWidth := C.int(width)

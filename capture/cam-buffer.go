@@ -19,8 +19,8 @@ type camBuffer struct {
 
 type Frame struct {
 	Buffer []byte
-	Width  int
-	Height int
+	Width  uint32
+	Height uint32
 
 	cam   *webcam.Webcam
 	index uint32
@@ -52,6 +52,27 @@ func (c *camBuffer) _start(device string) error {
 		return errors.Wrap(err, "Can not open device ")
 	}
 	defer cam.Close()
+
+	formats := cam.GetSupportedFormats()
+	if len(formats) == 0 {
+		return errors.New("No supported formats found")
+	}
+	width := uint32(0)
+	height := uint32(0)
+	for format := range formats {
+		sizes := cam.GetSupportedFrameSizes(format)
+		for _, size := range sizes {
+			fmt.Printf("Supported size: %d-%d x %d-%d\n", size.MinWidth, size.MaxWidth, size.MinHeight, size.MaxHeight)
+			if size.MaxWidth > width {
+				width = size.MaxWidth
+			}
+			if size.MaxHeight > height {
+				height = size.MaxHeight
+			}
+		}
+		cam.SetImageFormat(format, width, height)
+		break
+	}
 
 	err = cam.StartStreaming()
 	if err != nil {
@@ -94,8 +115,8 @@ func (c *camBuffer) _start(device string) error {
 
 		c.frame <- &Frame{
 			Buffer: frame,
-			Width:  340,
-			Height: 340,
+			Width:  width,
+			Height: height,
 			cam:    cam,
 			index:  frameIndex,
 		}
