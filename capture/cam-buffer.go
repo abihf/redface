@@ -9,12 +9,39 @@ import (
 	"github.com/pkg/errors"
 )
 
-type camBuffer struct {
+type Camera struct {
 	frame    chan *Frame
 	stopChan chan bool
 	err      error
+	device   string
 
-	stopped atomic.Value
+	stopped atomic.Bool
+}
+
+func Open(device string) *Camera {
+	c := &Camera{
+		frame:    make(chan *Frame, 1),
+		stopChan: make(chan bool, 1),
+		err:      nil,
+		device:   device,
+	}
+	c.stopped.Store(false)
+	return c
+}
+
+func (c *Camera) Err() error {
+	return c.err
+}
+
+func (c *Camera) Stream() chan *Frame {
+	go func() {
+		defer close(c.frame)
+		err := c.start(c.device)
+		if err != nil {
+			c.err = err
+		}
+	}()
+	return c.frame
 }
 
 type Frame struct {
@@ -26,27 +53,7 @@ type Frame struct {
 	index uint32
 }
 
-func newCamBuffer() *camBuffer {
-	c := &camBuffer{
-		frame:    make(chan *Frame, 1),
-		stopChan: make(chan bool, 1),
-		err:      nil,
-	}
-	c.stopped.Store(false)
-	return c
-}
-
-func (c *camBuffer) start(device string) {
-	go func() {
-		err := c._start(device)
-		if err != nil {
-			c.err = err
-		}
-		c.stopChan <- true
-	}()
-}
-
-func (c *camBuffer) _start(device string) error {
+func (c *Camera) start(device string) error {
 	cam, err := webcam.Open(device)
 	if err != nil {
 		return errors.Wrap(err, "Can not open device ")
@@ -105,6 +112,7 @@ func (c *camBuffer) _start(device string) error {
 		}
 
 		if c.isStopped() {
+			cam.ReleaseFrame(frameIndex)
 			break
 		}
 
@@ -125,11 +133,11 @@ func (c *camBuffer) _start(device string) error {
 	return nil
 }
 
-func (c *camBuffer) isStopped() bool {
-	return c.stopped.Load().(bool)
+func (c *Camera) isStopped() bool {
+	return c.stopped.Load()
 }
 
-func (c *camBuffer) stop() {
+func (c *Camera) Close() {
 	c.stopped.Store(true)
 }
 

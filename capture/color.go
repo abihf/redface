@@ -3,8 +3,8 @@ package capture
 func hasGoodBlackLevel(img []byte) bool {
 	dark := 0
 	total := len(img)
-	for i := 0; i < total; i++ {
-		if img[i] < 80 {
+	for _, p := range img {
+		if p < 80 {
 			dark++
 		}
 	}

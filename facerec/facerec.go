@@ -7,7 +7,9 @@ package facerec
 // #include "facerec.h"
 import "C"
 import (
+	"fmt"
 	"image"
+	"io"
 	"unsafe"
 )
 
@@ -30,6 +32,43 @@ type Face struct {
 
 // Descriptor holds 128-dimensional feature vector.
 type Descriptor [128]float32
+
+func (d *Descriptor) Distance(other *Descriptor) float64 {
+	cDescA := (*C.float)(unsafe.Pointer(&d[0]))
+	cDescB := (*C.float)(unsafe.Pointer(&other[0]))
+	return float64(C.descriptor_distance(cDescA, cDescB))
+}
+
+func (d *Descriptor) Marshal(w io.Writer) {
+	for i, v := range d {
+		if i > 0 {
+			w.Write([]byte(" "))
+		}
+		fmt.Fprintf(w, "%x", v)
+	}
+}
+
+func (d *Descriptor) Unmarshal(r io.Reader) (int, error) {
+	totalRead := 0
+	for i := range d {
+		var v float32
+		n, err := fmt.Fscanf(r, "%f", &v)
+		totalRead += n
+		if err != nil {
+			return totalRead, err
+		}
+		d[i] = v
+	}
+	return totalRead, nil
+}
+
+func (d *Descriptor) Middle(other *Descriptor) Descriptor {
+	var res Descriptor
+	for i, v := range d {
+		res[i] = (v + other[i]) / 2
+	}
+	return res
+}
 
 // New creates new face with the provided parameters.
 func New(r image.Rectangle, d Descriptor) Face {
@@ -84,14 +123,12 @@ func (rec *Recognizer) Recognize(imgData []byte, width, height uint32, maxFaces 
 	defer C.free(unsafe.Pointer(ret.descriptors))
 
 	rDataLen := numFaces * rectLen
-	rDataPtr := unsafe.Pointer(ret.rectangles)
-	rData := (*[1 << 30]C.long)(rDataPtr)[:rDataLen:rDataLen]
+	rData := unsafe.Slice((*C.long)(ret.rectangles), rDataLen)
 
 	dDataLen := numFaces * descrLen
-	dDataPtr := unsafe.Pointer(ret.descriptors)
-	dData := (*[1 << 30]float32)(dDataPtr)[:dDataLen:dDataLen]
+	dData := unsafe.Slice((*float32)(ret.descriptors), dDataLen)
 
-	for i := 0; i < numFaces; i++ {
+	for i := range numFaces {
 		face := Face{}
 		x0 := int(rData[i*rectLen])
 		y0 := int(rData[i*rectLen+1])
@@ -128,10 +165,4 @@ func (rec *Recognizer) Recognize(imgData []byte, width, height uint32, maxFaces 
 func (rec *Recognizer) Close() {
 	C.facerec_free(rec.ptr)
 	rec.ptr = nil
-}
-
-func GetDistance(a, b Descriptor) float64 {
-	cDescA := (*C.float)(unsafe.Pointer(&a[0]))
-	cDescB := (*C.float)(unsafe.Pointer(&b[0]))
-	return float64(C.descriptor_distance(cDescA, cDescB))
 }

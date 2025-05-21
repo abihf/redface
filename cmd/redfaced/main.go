@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -93,17 +92,19 @@ func handle(rec *facerec.Recognizer, c net.Conn) {
 			authReq := protocol.ToAuthReq(req)
 			log.Printf("Authorizing %s\n", authReq.User)
 
-			file := fmt.Sprintf("/etc/redface/models/%s.json", authReq.User)
+			file := fmt.Sprintf("/etc/redface/models/%s.face", authReq.User)
 			success, err := redface.Verify(rec, &redface.VerifyOption{
+				Device:    "/dev/video2",
 				ModelFile: file,
 				Timeout:   10 * time.Second,
-				Threshold: 0.12,
+				Threshold: 0.1,
 			})
 			if err == nil && !success {
 				err = errors.New("Access denied")
 			}
 
 			if err != nil {
+				fmt.Printf("Authentication error: %v", err)
 				protocol.WriteErrorRes(c, err)
 			} else {
 				protocol.WriteSuccessRes(c, nil)
@@ -117,7 +118,7 @@ func isAlreadyRun(path string) bool {
 		return false
 	}
 
-	pidStr, err := ioutil.ReadFile(path)
+	pidStr, err := os.ReadFile(path)
 	if err != nil {
 		log.Println("Can not read pid file", err)
 		return false

@@ -1,9 +1,9 @@
 package redface
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
-	"math"
+	"io"
 	"os"
 	"time"
 
@@ -11,12 +11,8 @@ import (
 	"github.com/abihf/redface/facerec"
 )
 
-const (
-	infraredDevice = "/dev/video2"
-	dataDir        = "/usr/share/redface"
-)
-
 type VerifyOption struct {
+	Device    string
 	ModelFile string
 	Timeout   time.Duration
 	Threshold float64
@@ -35,57 +31,52 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 		timeout = time.Now().Add(opt.Timeout)
 	}
 
-	capOption := &capture.Option{
-		Device: infraredDevice,
-	}
 	noFaceFrames := 0
-	err = capture.Capture(capOption, func(frame *capture.Frame) (bool, error) {
-		if opt.Timeout > 0 && time.Now().Sub(timeout) >= 0 {
-			return false, fmt.Errorf("Timeout %v", opt.Timeout)
+	cam := capture.Open(opt.Device)
+	defer cam.Close()
+	for frame := range cam.Stream() {
+		if frame == nil {
+			break
+		}
+
+		if opt.Timeout > 0 && time.Since(timeout) >= 0 {
+			frame.Free()
+			return false, fmt.Errorf("timeout %v", opt.Timeout)
 		}
 
 		rgb := grayToRGB(frame.Buffer)
 		frame.Free()
 		recStart := time.Now()
 		faces, err := rec.Recognize(rgb, frame.Width, frame.Height, 0)
-		recDuration := time.Now().Sub(recStart)
-
 		if err != nil {
 			return false, err
 		}
 
 		if len(faces) == 0 {
 			noFaceFrames++
-			return true, nil
+			continue
 		}
-		fmt.Printf("* Found %d faces in %v\n", len(faces), recDuration)
+		fmt.Printf("* Found %d faces in %v\n", len(faces), time.Since(recStart))
 
-		distance := math.MaxFloat64
 		for i, face := range faces {
 			fmt.Printf("  - Face [%d]:", i)
 			for _, model := range models {
-				d := facerec.GetDistance(model, face.Descriptor)
+				d := model.Distance(&face.Descriptor)
 				fmt.Printf(" %.3f", d)
-				if d < distance {
-					distance = d
+				if d < opt.Threshold {
+					println(" (found)")
+					return true, nil
 				}
 			}
 			println()
 		}
-
-		if distance < opt.Threshold {
-			result = true
-			return false, nil
-		}
-
-		return true, nil
-	})
+	}
 	if noFaceFrames > 0 {
 		fmt.Printf("> Frames without face found: %d\n\n", noFaceFrames)
 	}
 
-	if err != nil {
-		return false, err
+	if cam.Err() != nil {
+		return false, cam.Err()
 	}
 
 	return result, nil
@@ -99,17 +90,35 @@ func readModels(file string) ([]facerec.Descriptor, error) {
 	}
 	defer f.Close()
 
-	err = json.NewDecoder(f).Decode(&res)
-	return res, err
+	for {
+		var d facerec.Descriptor
+		_, err := d.Unmarshal(f)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		res = append(res, d)
+		_, err = fmt.Fscanf(f, "\n")
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+	}
+
+	return res, nil
 }
 
 func grayToRGB(gray []byte) []byte {
 	rgb := make([]byte, len(gray)*3)
-	for i := 0; i < len(gray); i++ {
+	for i, v := range gray {
 		offset := i * 3
-		rgb[offset+0] = gray[i]
-		rgb[offset+1] = gray[i]
-		rgb[offset+2] = gray[i]
+		rgb[offset+0] = v
+		rgb[offset+1] = v
+		rgb[offset+2] = v
 	}
 	return rgb
 }
