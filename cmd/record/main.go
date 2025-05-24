@@ -23,7 +23,7 @@ func mainE() error {
 	}
 	noFaceFrames := 0
 
-	file, err := os.Create("capture.jsonl")
+	file, err := os.Create("capture.face")
 	if err != nil {
 		return errors.Wrap(err, "Can not create capture.json")
 	}
@@ -37,9 +37,7 @@ func mainE() error {
 		if frame == nil {
 			break
 		}
-		rgb := grayToRGB(frame.Buffer)
-		frame.Free()
-		faces, err := rec.Recognize(rgb, frame.Width, frame.Height, 1)
+		faces, err := rec.Recognize(frame.Buffer, frame.Width, frame.Height, 1)
 		if err != nil {
 			return err
 		}
@@ -68,16 +66,4 @@ func mainE() error {
 	}
 
 	return cam.Err()
-}
-
-func grayToRGB(gray []byte) []byte {
-	rgb := make([]byte, len(gray)*3)
-	offset := 0
-	for _, v := range gray {
-		rgb[offset+0] = v
-		rgb[offset+1] = v
-		rgb[offset+2] = v
-		offset += 3
-	}
-	return rgb
 }

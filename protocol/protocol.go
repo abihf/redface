@@ -5,14 +5,6 @@ import (
 	"io"
 )
 
-func GetSockAddress() string {
-	return "/var/run/redface.sock"
-}
-
-func GetLockFile() string {
-	return "/var/run/redface.pid"
-}
-
 type Action string
 
 const (

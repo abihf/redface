@@ -10,10 +10,11 @@ import (
 )
 
 type Camera struct {
-	frame    chan *Frame
-	stopChan chan bool
-	err      error
-	device   string
+	frame         chan *Frame
+	stopChan      chan bool
+	err           error
+	device        string
+	droppedFrames uint32
 
 	stopped atomic.Bool
 }
@@ -39,6 +40,9 @@ func (c *Camera) Stream() chan *Frame {
 		err := c.start(c.device)
 		if err != nil {
 			c.err = err
+		}
+		if c.droppedFrames > 0 {
+			fmt.Printf("Dropped %d frames\n", c.droppedFrames)
 		}
 	}()
 	return c.frame
@@ -66,19 +70,27 @@ func (c *Camera) start(device string) error {
 	}
 	width := uint32(0)
 	height := uint32(0)
+	var usedFormat webcam.PixelFormat = 0
 	for format := range formats {
-		sizes := cam.GetSupportedFrameSizes(format)
-		for _, size := range sizes {
-			fmt.Printf("Supported size: %d-%d x %d-%d\n", size.MinWidth, size.MaxWidth, size.MinHeight, size.MaxHeight)
-			if size.MaxWidth > width {
-				width = size.MaxWidth
-			}
-			if size.MaxHeight > height {
-				height = size.MaxHeight
-			}
+		if _, ok := colorFormats[format]; ok {
+			usedFormat = format
+			break
 		}
-		cam.SetImageFormat(format, width, height)
-		break
+	}
+
+	sizes := cam.GetSupportedFrameSizes(usedFormat)
+	for _, size := range sizes {
+		fmt.Printf("Supported size: %s\n", size.GetString())
+		if size.MaxWidth > width {
+			width = size.MaxWidth
+		}
+		if size.MaxHeight > height {
+			height = size.MaxHeight
+		}
+	}
+	_, width, height, err = cam.SetImageFormat(usedFormat, width, height)
+	if err != nil {
+		return errors.Wrap(err, "Can not set image format")
 	}
 
 	err = cam.StartStreaming()
@@ -92,13 +104,13 @@ func (c *Camera) start(device string) error {
 		}
 
 		err = cam.WaitForFrame(1)
-		switch err.(type) {
-		case nil:
-		case *webcam.Timeout:
-			fmt.Fprint(os.Stderr, err.Error())
-			continue
-		default:
-			return errors.Wrap(err, "Frame wait failed")
+		if err != nil {
+			if errors.Is(err, &webcam.Timeout{}) {
+				fmt.Fprintf(os.Stderr, "error waiting frame %v", err)
+				continue
+			} else {
+				return errors.Wrap(err, "Wait for frame failed")
+			}
 		}
 
 		if c.isStopped() {
@@ -117,12 +129,15 @@ func (c *Camera) start(device string) error {
 		}
 
 		if len(c.frame) > 0 || !hasGoodBlackLevel(frame) {
+			c.droppedFrames++
 			cam.ReleaseFrame(frameIndex)
 			continue
 		}
+		rgb := colorFormats[usedFormat](frame)
+		cam.ReleaseFrame(frameIndex)
 
 		c.frame <- &Frame{
-			Buffer: frame,
+			Buffer: rgb,
 			Width:  width,
 			Height: height,
 			cam:    cam,
@@ -139,8 +154,4 @@ func (c *Camera) isStopped() bool {
 
 func (c *Camera) Close() {
 	c.stopped.Store(true)
-}
-
-func (f *Frame) Free() {
-	f.cam.ReleaseFrame(f.index)
 }

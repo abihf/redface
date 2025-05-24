@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"text/template"
 
+	"github.com/abihf/redface/config"
 	"github.com/abihf/redface/protocol"
 	"github.com/donpark/pam"
 )
@@ -17,9 +18,10 @@ const pamIgnore pam.Value = 25
 
 type pamRedface struct{}
 
+var conf = config.Load()
+
 func (*pamRedface) Authenticate(hdl pam.Handle, args pam.Args) pam.Value {
-	sockPath := protocol.GetSockAddress()
-	sockStat, err := os.Stat(sockPath)
+	sockStat, err := os.Stat(conf.Socket)
 	if os.IsNotExist(err) {
 		return pamIgnore
 	}
@@ -62,7 +64,7 @@ func (*pamRedface) Authenticate(hdl pam.Handle, args pam.Args) pam.Value {
 		}
 	}
 
-	conn, err := net.Dial("unix", sockPath)
+	conn, err := net.Dial("unix", conf.Socket)
 	if err != nil {
 		return pam.CredentialUnavailable
 	}

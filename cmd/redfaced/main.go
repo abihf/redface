@@ -11,12 +11,16 @@ import (
 	"time"
 
 	"github.com/abihf/redface"
+	"github.com/abihf/redface/config"
 	"github.com/abihf/redface/facerec"
 	"github.com/abihf/redface/protocol"
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/pkg/errors"
 )
 
 const dataDir = "/usr/share/redface"
+
+var conf = config.Load()
 
 func main() {
 	if err := serve(); err != nil {
@@ -25,8 +29,7 @@ func main() {
 }
 
 func serve() error {
-	procPath := protocol.GetLockFile()
-	if isAlreadyRun(procPath) {
+	if isAlreadyRun(conf.PidFile) {
 		return errors.New("already run")
 	}
 
@@ -35,19 +38,18 @@ func serve() error {
 		return errors.Wrap(err, "Can not initialize face recognizer")
 	}
 
-	writeLockFile(procPath)
-	defer os.Remove(procPath)
+	writeLockFile(conf.PidFile)
+	defer os.Remove(conf.PidFile)
 
-	sockPath := protocol.GetSockAddress()
-	os.Remove(sockPath)
+	os.Remove(conf.Socket)
 
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := net.Listen("unix", conf.Socket)
 	if err != nil {
 		return errors.Wrap(err, "Listen error")
 	}
 	defer ln.Close()
 
-	os.Chmod(sockPath, 0666)
+	os.Chmod(conf.Socket, 0666)
 
 	go func() {
 		for {
@@ -70,6 +72,7 @@ func serve() error {
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 
+	daemon.SdNotify(false, daemon.SdNotifyReady)
 	sig := <-sigc
 	log.Printf("Caught signal %s: shutting down.", sig)
 	return nil
@@ -94,10 +97,10 @@ func handle(rec *facerec.Recognizer, c net.Conn) {
 
 			file := fmt.Sprintf("/etc/redface/models/%s.face", authReq.User)
 			success, err := redface.Verify(rec, &redface.VerifyOption{
-				Device:    "/dev/video2",
+				Device:    conf.Device,
 				ModelFile: file,
-				Timeout:   10 * time.Second,
-				Threshold: 0.1,
+				Timeout:   time.Duration(conf.Timeout) * time.Second,
+				Threshold: conf.Threshold,
 			})
 			if err == nil && !success {
 				err = errors.New("Access denied")

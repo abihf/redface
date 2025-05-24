@@ -8,4 +8,7 @@ require (
 	github.com/pkg/errors v0.9.1
 )
 
-require golang.org/x/sys v0.33.0 // indirect
+require (
+	github.com/coreos/go-systemd/v22 v22.5.0
+	golang.org/x/sys v0.33.0 // indirect
+)

@@ -40,14 +40,11 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 		}
 
 		if opt.Timeout > 0 && time.Since(timeout) >= 0 {
-			frame.Free()
 			return false, fmt.Errorf("timeout %v", opt.Timeout)
 		}
 
-		rgb := grayToRGB(frame.Buffer)
-		frame.Free()
 		recStart := time.Now()
-		faces, err := rec.Recognize(rgb, frame.Width, frame.Height, 0)
+		faces, err := rec.Recognize(frame.Buffer, frame.Width, frame.Height, 0)
 		if err != nil {
 			return false, err
 		}
@@ -110,15 +107,4 @@ func readModels(file string) ([]facerec.Descriptor, error) {
 	}
 
 	return res, nil
-}
-
-func grayToRGB(gray []byte) []byte {
-	rgb := make([]byte, len(gray)*3)
-	for i, v := range gray {
-		offset := i * 3
-		rgb[offset+0] = v
-		rgb[offset+1] = v
-		rgb[offset+2] = v
-	}
-	return rgb
 }
