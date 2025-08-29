@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/abihf/redface/capture"
 	"github.com/abihf/redface/facerec"
@@ -58,8 +57,7 @@ func mainE() error {
 				descriptor = descriptor.Middle(&face.Descriptor)
 			}
 			descriptor.Marshal(file)
-			fmt.Fprintln(file)
-			strings.NewReader("-0x1.bbef1p-04 0x1.0a6d32p-03 0x1.d8571p-04")
+			file.Write([]byte{'\n'})
 			fmt.Printf("  - Face [%d] (distance: %.3f)", i, distance)
 			println()
 		}

@@ -11,7 +11,7 @@ BUILD_DIR = ./build
 # BUILD
 #----------------------------------------------------------------------------------------
 
-GOFILES = $(wildcard **/*.go) $(wildcard *.go)
+GOFILES = $(wildcard **/*.go) $(wildcard *.go) go.mod go.sum
 
 build: pam daemon
 

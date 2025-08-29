@@ -1,6 +1,6 @@
 module github.com/abihf/redface
 
-go 1.24
+go 1.25
 
 require (
 	github.com/blackjack/webcam v0.6.1
@@ -9,6 +9,6 @@ require (
 )
 
 require (
-	github.com/coreos/go-systemd/v22 v22.5.0
-	golang.org/x/sys v0.33.0 // indirect
+	github.com/coreos/go-systemd/v22 v22.6.0
+	golang.org/x/sys v0.35.0 // indirect
 )

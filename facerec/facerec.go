@@ -42,7 +42,7 @@ func (d *Descriptor) Distance(other *Descriptor) float64 {
 func (d *Descriptor) Marshal(w io.Writer) {
 	for i, v := range d {
 		if i > 0 {
-			w.Write([]byte(" "))
+			w.Write([]byte{' '})
 		}
 		fmt.Fprintf(w, "%x", v)
 	}
