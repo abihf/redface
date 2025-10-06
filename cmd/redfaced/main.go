@@ -15,7 +15,6 @@ import (
 	"github.com/abihf/redface/facerec"
 	"github.com/abihf/redface/protocol"
 	"github.com/coreos/go-systemd/v22/daemon"
-	"github.com/pkg/errors"
 )
 
 const dataDir = "/usr/share/redface"
@@ -30,12 +29,12 @@ func main() {
 
 func serve() error {
 	if isAlreadyRun(conf.PidFile) {
-		return errors.New("already run")
+		return fmt.Errorf("already run")
 	}
 
 	recognizer, err := facerec.NewRecognizer(dataDir)
 	if err != nil {
-		return errors.Wrap(err, "Can not initialize face recognizer")
+		return fmt.Errorf("can not initialize face recognizer: %w", err)
 	}
 
 	writeLockFile(conf.PidFile)
@@ -45,7 +44,7 @@ func serve() error {
 
 	ln, err := net.Listen("unix", conf.Socket)
 	if err != nil {
-		return errors.Wrap(err, "Listen error")
+		return fmt.Errorf("listen error: %w", err)
 	}
 	defer ln.Close()
 
@@ -103,7 +102,7 @@ func handle(rec *facerec.Recognizer, c net.Conn) {
 				Threshold: conf.Threshold,
 			})
 			if err == nil && !success {
-				err = errors.New("Access denied")
+				err = fmt.Errorf("face not recognized")
 			}
 
 			if err != nil {

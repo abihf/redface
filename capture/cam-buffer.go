@@ -1,12 +1,13 @@
 package capture
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 
 	"github.com/blackjack/webcam"
-	"github.com/pkg/errors"
 )
 
 type Camera struct {
@@ -60,13 +61,13 @@ type Frame struct {
 func (c *Camera) start(device string) error {
 	cam, err := webcam.Open(device)
 	if err != nil {
-		return errors.Wrap(err, "Can not open device ")
+		return fmt.Errorf("can not open device %s: %w", device, err)
 	}
 	defer cam.Close()
 
 	formats := cam.GetSupportedFormats()
 	if len(formats) == 0 {
-		return errors.New("No supported formats found")
+		return fmt.Errorf("no supported formats found")
 	}
 	width := uint32(0)
 	height := uint32(0)
@@ -78,9 +79,15 @@ func (c *Camera) start(device string) error {
 		}
 	}
 
+	if usedFormat == 0 {
+		supportedFormat := []string{}
+		for format := range formats {
+			supportedFormat = append(supportedFormat, fourccToString(format))
+		}
+		return fmt.Errorf("no supported color format found: %s", strings.Join(supportedFormat, ", "))
+	}
 	sizes := cam.GetSupportedFrameSizes(usedFormat)
 	for _, size := range sizes {
-		fmt.Printf("Supported size: %s\n", size.GetString())
 		if size.MaxWidth > width {
 			width = size.MaxWidth
 		}
@@ -90,12 +97,12 @@ func (c *Camera) start(device string) error {
 	}
 	_, width, height, err = cam.SetImageFormat(usedFormat, width, height)
 	if err != nil {
-		return errors.Wrap(err, "Can not set image format")
+		return fmt.Errorf("can not set image format: %w", err)
 	}
 
 	err = cam.StartStreaming()
 	if err != nil {
-		return errors.Wrap(err, "Can not start streaming")
+		return fmt.Errorf("can not start streaming: %w", err)
 	}
 
 	for {
@@ -109,7 +116,7 @@ func (c *Camera) start(device string) error {
 				fmt.Fprintf(os.Stderr, "error waiting frame %v", err)
 				continue
 			} else {
-				return errors.Wrap(err, "Wait for frame failed")
+				return fmt.Errorf("wait for frame failed: %w", err)
 			}
 		}
 
@@ -120,7 +127,7 @@ func (c *Camera) start(device string) error {
 		frame, frameIndex, err := cam.GetFrame()
 		if err != nil {
 			cam.ReleaseFrame(frameIndex)
-			return errors.Wrap(err, "Read frame failed")
+			return fmt.Errorf("read frame failed: %w", err)
 		}
 
 		if c.isStopped() {

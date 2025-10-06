@@ -5,9 +5,11 @@ import (
 	"os"
 
 	"github.com/abihf/redface/capture"
+	"github.com/abihf/redface/config"
 	"github.com/abihf/redface/facerec"
-	"github.com/pkg/errors"
 )
+
+var conf = config.Load()
 
 func main() {
 	if err := mainE(); err != nil {
@@ -18,19 +20,19 @@ func main() {
 func mainE() error {
 	rec, err := facerec.NewRecognizer("/usr/share/redface")
 	if err != nil {
-		return errors.Wrap(err, "Can not initialize face recognizer")
+		return fmt.Errorf("can not initialize face recognizer: %w", err)
 	}
 	noFaceFrames := 0
 
 	file, err := os.Create("capture.face")
 	if err != nil {
-		return errors.Wrap(err, "Can not create capture.json")
+		return fmt.Errorf("can not create capture.face: %w", err)
 	}
 	defer file.Close()
 
 	var descriptor facerec.Descriptor
 	first := true
-	cam := capture.Open("/dev/video2")
+	cam := capture.Open(conf.Device)
 	defer cam.Close()
 	for frame := range cam.Stream() {
 		if frame == nil {
