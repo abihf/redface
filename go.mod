@@ -9,5 +9,5 @@ require (
 
 require (
 	github.com/coreos/go-systemd/v22 v22.6.0
-	golang.org/x/sys v0.36.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
 )
