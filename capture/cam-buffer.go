@@ -69,8 +69,6 @@ func (c *Camera) start(device string) error {
 	if len(formats) == 0 {
 		return fmt.Errorf("no supported formats found")
 	}
-	width := uint32(0)
-	height := uint32(0)
 	var usedFormat webcam.PixelFormat = 0
 	for format := range formats {
 		if _, ok := colorFormats[format]; ok {
@@ -87,6 +85,8 @@ func (c *Camera) start(device string) error {
 		return fmt.Errorf("no supported color format found: %s", strings.Join(supportedFormat, ", "))
 	}
 	sizes := cam.GetSupportedFrameSizes(usedFormat)
+	width := uint32(0)
+	height := uint32(0)
 	for _, size := range sizes {
 		if size.MaxWidth > width {
 			width = size.MaxWidth
@@ -95,9 +95,12 @@ func (c *Camera) start(device string) error {
 			height = size.MaxHeight
 		}
 	}
-	_, width, height, err = cam.SetImageFormat(usedFormat, width, height)
+	usedFormat, width, height, err = cam.SetImageFormat(usedFormat, width, height)
 	if err != nil {
 		return fmt.Errorf("can not set image format: %w", err)
+	}
+	if _, ok := colorFormats[usedFormat]; !ok {
+		return fmt.Errorf("selected format is not supported for color conversion: %s", fourccToString(usedFormat))
 	}
 
 	err = cam.StartStreaming()
@@ -135,7 +138,7 @@ func (c *Camera) start(device string) error {
 			break
 		}
 
-		if len(c.frame) > 0 || !hasGoodBlackLevel(frame) {
+		if len(c.frame) > 0 || (usedFormat == ColorGrey && !hasGoodBlackLevel(frame)) {
 			c.droppedFrames++
 			cam.ReleaseFrame(frameIndex)
 			continue

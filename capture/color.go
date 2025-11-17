@@ -4,7 +4,9 @@ import (
 	"github.com/blackjack/webcam"
 )
 
+// #cgo CFLAGS: -O3 -mavx2 -mssse3
 // #include <linux/videodev2.h>
+// #include "color.h"
 import "C"
 
 const (
@@ -12,6 +14,10 @@ const (
 	ColorRGB  = webcam.PixelFormat(C.V4L2_PIX_FMT_RGB24)
 	ColorYUYV = webcam.PixelFormat(C.V4L2_PIX_FMT_YUYV)
 )
+
+func init() {
+	C.init_color_conversion()
+}
 
 type colorTransformer func([]byte) []byte
 
@@ -32,13 +38,7 @@ func copyRgb(img []byte) []byte {
 
 func grayToRGB(gray []byte) []byte {
 	rgb := make([]byte, len(gray)*3)
-	offset := 0
-	for _, v := range gray {
-		rgb[offset+0] = v
-		rgb[offset+1] = v
-		rgb[offset+2] = v
-		offset += 3
-	}
+	C.grey_to_rgb((*C.uint8_t)(&gray[0]), C.size_t(len(gray)), (*C.uint8_t)(&rgb[0]))
 	return rgb
 }
 
