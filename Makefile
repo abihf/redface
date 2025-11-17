@@ -38,7 +38,7 @@ install-daemon: daemon
 	install data/redfaced.service $(DESTDIR)$(LIBDIR)/systemd/system/redfaced.service
 
 install-data:
-	install -d -m 700 $(DESTDIR)$(DATADIR)/redface
+	install -d -m 755 $(DESTDIR)$(DATADIR)/redface
 	install data/dlib_face_recognition_resnet_model_v1.dat $(DESTDIR)$(DATADIR)/redface/dlib_face_recognition_resnet_model_v1.dat
 	install data/shape_predictor_5_face_landmarks.dat $(DESTDIR)$(DATADIR)/redface/shape_predictor_5_face_landmarks.dat
 
