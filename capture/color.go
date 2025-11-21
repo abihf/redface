@@ -4,7 +4,7 @@ import (
 	"github.com/blackjack/webcam"
 )
 
-// #cgo CFLAGS: -O3 -mavx2 -mssse3
+// #cgo CFLAGS: -O3 -Wall -O3 -march=native
 // #include <linux/videodev2.h>
 // #include "color.h"
 import "C"

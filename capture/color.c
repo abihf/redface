@@ -6,20 +6,15 @@ static __m128i M0;
 static __m128i M1;
 static __m128i M2;
 
-static inline void pack16_gray_to_3x16_rgb(__m128i g, uint8_t *dst)
-{
-    
-    _mm_storeu_si128((__m128i*)(dst +  0), _mm_shuffle_epi8(g, M0));   // 16 bytes
-    _mm_storeu_si128((__m128i*)(dst + 16), _mm_shuffle_epi8(g, M1));   // 16 bytes
-    _mm_storeu_si128((__m128i*)(dst + 32), _mm_shuffle_epi8(g, M2));   // 16 bytes  => total 48
-}
+#if defined(__AVX512BW__)
+static __m512i M0_512;
+static __m512i M1_512;
+static __m512i M2_512;
+#endif
 
 void init_color_conversion(void)
 {
     // Masks that turn 16 gray bytes g0..g15 into 48 RGB bytes:
-    // chunk A: [g0,g0,g0, g1,g1,g1, ..., g4,g4,g4, g5]
-    // chunk B: [g5,g5, g6,g6,g6, ..., g9,g9,g9, g10,g10]
-    // chunk C: [g10, g11,g11,g11, ..., g15,g15,g15]
     M0 = _mm_setr_epi8(
         0,0,0, 1,1,1, 2,2,2, 3,3,3, 4,4,4, 5
     );
@@ -29,6 +24,20 @@ void init_color_conversion(void)
     M2 = _mm_setr_epi8(
         10, 11,11,11, 12,12,12, 13,13,13, 14,14,14, 15,15,15
     );
+
+#if defined(__AVX512BW__)
+    // Broadcast the 16-byte masks to all four 128-bit lanes of a 512-bit register.
+    M0_512 = _mm512_broadcast_i32x4(M0);
+    M1_512 = _mm512_broadcast_i32x4(M1);
+    M2_512 = _mm512_broadcast_i32x4(M2);
+#endif
+}
+
+static inline void pack16_gray_to_3x16_rgb(__m128i g, uint8_t *dst)
+{
+    _mm_storeu_si128((__m128i*)(dst +  0), _mm_shuffle_epi8(g, M0));   // 16 bytes
+    _mm_storeu_si128((__m128i*)(dst + 16), _mm_shuffle_epi8(g, M1));   // 16 bytes
+    _mm_storeu_si128((__m128i*)(dst + 32), _mm_shuffle_epi8(g, M2));   // 16 bytes  => total 48
 }
 
 void grey_to_rgb(const uint8_t *in, size_t len, uint8_t *out)
@@ -36,8 +45,26 @@ void grey_to_rgb(const uint8_t *in, size_t len, uint8_t *out)
     size_t i = 0;
     uint8_t *o = out;
 
-// #if defined(__AVX2__)
-    // Process 32 pixels (32 gray bytes) -> 96 RGB bytes per iteration
+#if defined(__AVX512BW__)
+    // AVX-512BW: process 64 pixels (64 bytes) -> 192 RGB bytes per iteration
+    // Input layout in v: [g0..g15 | g16..g31 | g32..g47 | g48..g63] per 128-bit lane.
+    for (; i + 64 <= len; i += 64, o += 192) {
+        __m512i v  = _mm512_loadu_si512((const void*)(in + i));
+
+        // Each shuffle uses the same lane-local mask as the SSE version.
+        __m512i r0 = _mm512_shuffle_epi8(v, M0_512);  // 4×16 bytes
+        __m512i r1 = _mm512_shuffle_epi8(v, M1_512);  // 4×16 bytes
+        __m512i r2 = _mm512_shuffle_epi8(v, M2_512);  // 4×16 bytes
+
+        // 3 * 64B = 192B: exactly 4×48B (for 4 blocks of 16 pixels).
+        _mm512_storeu_si512((__m512i*)(o +   0), r0);
+        _mm512_storeu_si512((__m512i*)(o +  64), r1);
+        _mm512_storeu_si512((__m512i*)(o + 128), r2);
+    }
+#endif
+
+#if defined(__AVX2__)
+    // AVX2: process 32 pixels (32 gray bytes) -> 96 RGB bytes per iteration
     for (; i + 32 <= len; i += 32, o += 96) {
         __m256i v  = _mm256_loadu_si256((const __m256i*)(in + i));
         __m128i lo = _mm256_castsi256_si128(v);
@@ -49,15 +76,15 @@ void grey_to_rgb(const uint8_t *in, size_t len, uint8_t *out)
         // high 16 pixels -> next 48 bytes
         pack16_gray_to_3x16_rgb(hi, o + 48);
     }
-// #endif
+#endif
 
-    // Process remaining blocks of 16 with SSSE3 (also works even without AVX2)
-// #if defined(__SSSE3__)
+#if defined(__SSSE3__)
+    // Process remaining blocks of 16 with SSSE3
     for (; i + 16 <= len; i += 16, o += 48) {
         __m128i g = _mm_loadu_si128((const __m128i*)(in + i));
         pack16_gray_to_3x16_rgb(g, o);
     }
-// #endif
+#endif
 
     // Scalar tail (<=15 pixels)
     for (; i < len; ++i, o += 3) {

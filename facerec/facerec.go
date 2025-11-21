@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	rectLen  = 4
+	// rectLen  = 4
 	descrLen = 128
 )
 
@@ -26,7 +26,7 @@ type Recognizer struct {
 
 // Face holds coordinates and descriptor of the human face.
 type Face struct {
-	Rectangle  image.Rectangle
+	// Rectangle  image.Rectangle
 	Descriptor Descriptor
 }
 
@@ -72,7 +72,7 @@ func (d *Descriptor) Middle(other *Descriptor) Descriptor {
 
 // New creates new face with the provided parameters.
 func New(r image.Rectangle, d Descriptor) Face {
-	return Face{r, d}
+	return Face{Descriptor: d}
 }
 
 // NewRecognizer returns a new recognizer interface. modelDir points to
@@ -119,22 +119,22 @@ func (rec *Recognizer) Recognize(imgData []byte, width, height uint32, maxFaces 
 	}
 
 	// Copy faces data to Go structure.
-	defer C.free(unsafe.Pointer(ret.rectangles))
+	// defer C.free(unsafe.Pointer(ret.rectangles))
 	defer C.free(unsafe.Pointer(ret.descriptors))
 
-	rDataLen := numFaces * rectLen
-	rData := unsafe.Slice((*C.long)(ret.rectangles), rDataLen)
+	// rDataLen := numFaces * rectLen
+	// rData := unsafe.Slice((*C.long)(ret.rectangles), rDataLen)
 
 	dDataLen := numFaces * descrLen
 	dData := unsafe.Slice((*float32)(ret.descriptors), dDataLen)
 
 	for i := range numFaces {
 		face := Face{}
-		x0 := int(rData[i*rectLen])
-		y0 := int(rData[i*rectLen+1])
-		x1 := int(rData[i*rectLen+2])
-		y1 := int(rData[i*rectLen+3])
-		face.Rectangle = image.Rect(x0, y0, x1, y1)
+		// x0 := int(rData[i*rectLen])
+		// y0 := int(rData[i*rectLen+1])
+		// x1 := int(rData[i*rectLen+2])
+		// y1 := int(rData[i*rectLen+3])
+		// face.Rectangle = image.Rect(x0, y0, x1, y1)
 		copy(face.Descriptor[:], dData[i*descrLen:(i+1)*descrLen])
 		faces = append(faces, face)
 	}

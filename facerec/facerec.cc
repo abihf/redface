@@ -197,15 +197,15 @@ faceret *facerec_recognize(facerec *rec, const uint8_t *img_data, int width, int
 	ret->num_faces = descrs.size();
 	if (ret->num_faces == 0)
 		return ret;
-	ret->rectangles = (long *)malloc(ret->num_faces * RECT_SIZE);
-	for (int i = 0; i < ret->num_faces; i++)
-	{
-		long *dst = ret->rectangles + i * 4;
-		dst[0] = rects[i].left();
-		dst[1] = rects[i].top();
-		dst[2] = rects[i].right();
-		dst[3] = rects[i].bottom();
-	}
+	// ret->rectangles = (long *)malloc(ret->num_faces * RECT_SIZE);
+	// for (int i = 0; i < ret->num_faces; i++)
+	// {
+	// 	long *dst = ret->rectangles + i * 4;
+	// 	dst[0] = rects[i].left();
+	// 	dst[1] = rects[i].top();
+	// 	dst[2] = rects[i].right();
+	// 	dst[3] = rects[i].bottom();
+	// }
 	ret->descriptors = (float *)malloc(ret->num_faces * DESCR_SIZE);
 	for (int i = 0; i < ret->num_faces; i++)
 	{
