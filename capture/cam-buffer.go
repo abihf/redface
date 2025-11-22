@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 
+	"github.com/abihf/redface/utils/thread"
 	"github.com/blackjack/webcam"
 )
 
@@ -37,6 +39,10 @@ func (c *Camera) Err() error {
 
 func (c *Camera) Stream() chan *Frame {
 	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		thread.SetCPUAffinity(1) // set to CPU 1
+
 		defer close(c.frame)
 		err := c.start(c.device)
 		if err != nil {

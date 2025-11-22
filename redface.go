@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/abihf/redface/capture"
 	"github.com/abihf/redface/facerec"
+	"github.com/abihf/redface/utils/thread"
 )
 
 type VerifyOption struct {
@@ -19,6 +21,7 @@ type VerifyOption struct {
 }
 
 func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
+
 	models, err := readModels(opt.ModelFile)
 	if err != nil {
 		return false, err
@@ -34,6 +37,11 @@ func Verify(rec *facerec.Recognizer, opt *VerifyOption) (bool, error) {
 	noFaceFrames := 0
 	cam := capture.Open(opt.Device)
 	defer cam.Close()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	thread.SetCPUAffinity(0)
+
 	for frame := range cam.Stream() {
 		if frame == nil {
 			break

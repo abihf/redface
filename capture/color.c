@@ -11,10 +11,6 @@ static __m512i IDX0_512;
 static __m512i IDX1_512;
 static __m512i IDX2_512;
 
-// index tables for vpermb (built in init_color_conversion)
-static uint8_t idx0_bytes[64];
-static uint8_t idx1_bytes[64];
-static uint8_t idx2_bytes[64];
 #elif defined(__AVX512BW__)
 static __m512i M0_512;
 static __m512i M1_512;
@@ -44,6 +40,9 @@ void init_color_conversion(void)
     //   pixel index = j / 3
     //
     // So idx_c[p] = (c*64 + p)/3
+    uint8_t idx0_bytes[64];
+    uint8_t idx1_bytes[64];
+    uint8_t idx2_bytes[64];
     for (int p = 0; p < 64; ++p) {
         idx0_bytes[p] = (uint8_t)((0*64 + p) / 3);
         idx1_bytes[p] = (uint8_t)((1*64 + p) / 3);
