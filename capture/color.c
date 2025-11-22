@@ -6,7 +6,16 @@ static __m128i M0;
 static __m128i M1;
 static __m128i M2;
 
-#if defined(__AVX512BW__)
+#if defined(__AVX512VBMI__)
+static __m512i IDX0_512;
+static __m512i IDX1_512;
+static __m512i IDX2_512;
+
+// index tables for vpermb (built in init_color_conversion)
+static uint8_t idx0_bytes[64];
+static uint8_t idx1_bytes[64];
+static uint8_t idx2_bytes[64];
+#elif defined(__AVX512BW__)
 static __m512i M0_512;
 static __m512i M1_512;
 static __m512i M2_512;
@@ -25,7 +34,26 @@ void init_color_conversion(void)
         10, 11,11,11, 12,12,12, 13,13,13, 14,14,14, 15,15,15
     );
 
-#if defined(__AVX512BW__)
+#if defined(__AVX512VBMI__)
+    // Build index vectors for vpermb:
+    //
+    // We want out[3*i+0..2] = g[i]  for i=0..63.
+    // We produce 3 chunks of 64 bytes each:
+    //   chunk c in {0,1,2}, position p in {0..63}
+    //   global output index j = c*64 + p
+    //   pixel index = j / 3
+    //
+    // So idx_c[p] = (c*64 + p)/3
+    for (int p = 0; p < 64; ++p) {
+        idx0_bytes[p] = (uint8_t)((0*64 + p) / 3);
+        idx1_bytes[p] = (uint8_t)((1*64 + p) / 3);
+        idx2_bytes[p] = (uint8_t)((2*64 + p) / 3);
+    }
+
+    IDX0_512 = _mm512_loadu_si512((const __m512i*)idx0_bytes);
+    IDX1_512 = _mm512_loadu_si512((const __m512i*)idx1_bytes);
+    IDX2_512 = _mm512_loadu_si512((const __m512i*)idx2_bytes);
+#elif defined(__AVX512BW__)
     // Broadcast the 16-byte masks to all four 128-bit lanes of a 512-bit register.
     M0_512 = _mm512_broadcast_i32x4(M0);
     M1_512 = _mm512_broadcast_i32x4(M1);
@@ -44,22 +72,47 @@ void grey_to_rgb(const uint8_t *in, size_t len, uint8_t *out)
 {
     size_t i = 0;
     uint8_t *o = out;
+#if defined(__AVX512VBMI__)
+    // AVX-512VBMI: 64 pixels -> 192 RGB bytes per iteration
+    for (; i + 64 <= len; i += 64, o += 192) {
+        __m512i g = _mm512_loadu_si512((const void*)(in + i));
 
-#if defined(__AVX512BW__)
+        // 3 × 64-byte stores = 192 bytes = 64 pixels × 3 bytes/pixel
+        _mm512_storeu_si512((__m512i*)(o +   0), _mm512_permutexvar_epi8(IDX0_512, g));
+        _mm512_storeu_si512((__m512i*)(o +  64), _mm512_permutexvar_epi8(IDX1_512, g));
+        _mm512_storeu_si512((__m512i*)(o + 128), _mm512_permutexvar_epi8(IDX2_512, g));
+    }
+#elif defined(__AVX512BW__)
     // AVX-512BW: process 64 pixels (64 bytes) -> 192 RGB bytes per iteration
     // Input layout in v: [g0..g15 | g16..g31 | g32..g47 | g48..g63] per 128-bit lane.
     for (; i + 64 <= len; i += 64, o += 192) {
         __m512i v  = _mm512_loadu_si512((const void*)(in + i));
 
         // Each shuffle uses the same lane-local mask as the SSE version.
-        __m512i r0 = _mm512_shuffle_epi8(v, M0_512);  // 4×16 bytes
-        __m512i r1 = _mm512_shuffle_epi8(v, M1_512);  // 4×16 bytes
-        __m512i r2 = _mm512_shuffle_epi8(v, M2_512);  // 4×16 bytes
+        __m512i r0 = _mm512_shuffle_epi8(v, M0_512);
+        __m512i r1 = _mm512_shuffle_epi8(v, M1_512);
+        __m512i r2 = _mm512_shuffle_epi8(v, M2_512);
 
-        // 3 * 64B = 192B: exactly 4×48B (for 4 blocks of 16 pixels).
-        _mm512_storeu_si512((__m512i*)(o +   0), r0);
-        _mm512_storeu_si512((__m512i*)(o +  64), r1);
-        _mm512_storeu_si512((__m512i*)(o + 128), r2);
+        // lane 0
+        _mm_storeu_si128((__m128i*)(o +   0), _mm512_castsi512_si128(r0));
+        _mm_storeu_si128((__m128i*)(o +  16), _mm512_castsi512_si128(r1));
+        _mm_storeu_si128((__m128i*)(o +  32), _mm512_castsi512_si128(r2));
+
+        // lane 1
+        _mm_storeu_si128((__m128i*)(o +  48), _mm512_extracti32x4_epi32(r0, 1));
+        _mm_storeu_si128((__m128i*)(o +  64), _mm512_extracti32x4_epi32(r1, 1));
+        _mm_storeu_si128((__m128i*)(o +  80), _mm512_extracti32x4_epi32(r2, 1));
+
+        // lane 2
+        _mm_storeu_si128((__m128i*)(o +  96), _mm512_extracti32x4_epi32(r0, 2));
+        _mm_storeu_si128((__m128i*)(o + 112), _mm512_extracti32x4_epi32(r1, 2));
+        _mm_storeu_si128((__m128i*)(o + 128), _mm512_extracti32x4_epi32(r2, 2));
+
+        // lane 3
+        _mm_storeu_si128((__m128i*)(o + 144), _mm512_extracti32x4_epi32(r0, 3));
+        _mm_storeu_si128((__m128i*)(o + 160), _mm512_extracti32x4_epi32(r1, 3));
+        _mm_storeu_si128((__m128i*)(o + 176), _mm512_extracti32x4_epi32(r2, 3));
+
     }
 #endif
 
