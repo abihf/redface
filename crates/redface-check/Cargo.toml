@@ -1,0 +1,12 @@
+[package]
+name = "redface-check"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+redface-runtime = { workspace = true }
+libc = { workspace = true }
+
+[[bin]]
+name = "redface-check"
+path = "src/main.rs"

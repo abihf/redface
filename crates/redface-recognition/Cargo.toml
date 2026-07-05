@@ -1,0 +1,16 @@
+[package]
+name = "redface-recognition"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+build-native = ["dlib-face-recognition/build-native"]
+openblas = ["dlib-face-recognition/openblas"]
+
+[dependencies]
+dlib-face-recognition = { workspace = true }
+redface-core = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

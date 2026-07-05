@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/redface-core", "crates/redface-recognition", "crates/redface-record", "crates/redface-capture", "crates/redface-runtime", "crates/redfaced", "crates/redface-check", "crates/pam-redface"]
+resolver = "3"
+
+[workspace.dependencies]
+dlib-face-recognition = { version = "0.3.2", default-features = false }
+redface-core = { path = "crates/redface-core" }
+redface-capture = { path = "crates/redface-capture" }
+redface-recognition = { path = "crates/redface-recognition" }
+redface-runtime = { path = "crates/redface-runtime" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libc = "0.2"
+
+[patch.crates-io]
+dlib-face-recognition = { path = "vendor/dlib-face-recognition" }
+
+

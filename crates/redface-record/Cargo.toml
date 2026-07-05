@@ -1,0 +1,17 @@
+[package]
+name = "redface-record"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+redface-capture = { workspace = true }
+redface-core = { workspace = true }
+redface-recognition = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "redface-record"
+path = "src/main.rs"
+
