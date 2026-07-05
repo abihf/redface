@@ -2,6 +2,19 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+#[cfg(target_arch = "x86")]
+use std::arch::x86::{
+    __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8,
+    _mm_storeu_si128, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256,
+    _mm512_extracti32x4_epi32, _mm512_loadu_si512,
+};
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{
+    __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8,
+    _mm_storeu_si128, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256,
+    _mm512_extracti32x4_epi32, _mm512_loadu_si512,
+};
+
 use v4l::buffer::Type;
 use v4l::format::{Format, FourCC};
 use v4l::framesize::{FrameSize, FrameSizeEnum};
@@ -219,11 +232,170 @@ fn yuyv_fourcc() -> FourCC {
 }
 
 fn gray_to_rgb(gray: &[u8]) -> Vec<u8> {
-    let mut rgb = Vec::with_capacity(gray.len() * 3);
-    for pixel in gray {
-        rgb.extend_from_slice(&[*pixel, *pixel, *pixel]);
+    let mut rgb = vec![0_u8; gray.len() * 3];
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("ssse3")
+        {
+            // Safe because the runtime feature checks guarantee the required AVX-512 and SSSE3 support.
+            unsafe { gray_to_rgb_avx512(gray, &mut rgb) };
+            return rgb;
+        }
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("ssse3")
+        {
+            // Safe because the runtime feature checks guarantee the required AVX2 and SSSE3 support.
+            unsafe { gray_to_rgb_avx2(gray, &mut rgb) };
+            return rgb;
+        }
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            // Safe because the runtime feature check guarantees SSSE3 support.
+            unsafe { gray_to_rgb_ssse3(gray, &mut rgb) };
+            return rgb;
+        }
     }
+
+    gray_to_rgb_scalar(gray, &mut rgb);
     rgb
+}
+
+fn gray_to_rgb_scalar(gray: &[u8], rgb: &mut [u8]) {
+    for (index, pixel) in gray.iter().copied().enumerate() {
+        let offset = index * 3;
+        rgb[offset] = pixel;
+        rgb[offset + 1] = pixel;
+        rgb[offset + 2] = pixel;
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw,avx2,ssse3")]
+unsafe fn gray_to_rgb_avx512(gray: &[u8], rgb: &mut [u8]) {
+    let masks = unsafe { shuffle_masks() };
+
+    let mut input_offset = 0;
+    let mut output_offset = 0;
+    while input_offset + 64 <= gray.len() {
+        // Safe because the loop bounds guarantee 64 readable input bytes.
+        let pixels = unsafe { _mm512_loadu_si512(gray.as_ptr().add(input_offset).cast::<__m512i>()) };
+
+        unsafe { store_rgb_block_16(_mm512_extracti32x4_epi32::<0>(pixels), &masks, rgb, output_offset) };
+        unsafe { store_rgb_block_16(
+            _mm512_extracti32x4_epi32::<1>(pixels),
+            &masks,
+            rgb,
+            output_offset + 48,
+        ) };
+        unsafe { store_rgb_block_16(
+            _mm512_extracti32x4_epi32::<2>(pixels),
+            &masks,
+            rgb,
+            output_offset + 96,
+        ) };
+        unsafe { store_rgb_block_16(
+            _mm512_extracti32x4_epi32::<3>(pixels),
+            &masks,
+            rgb,
+            output_offset + 144,
+        ) };
+
+        input_offset += 64;
+        output_offset += 192;
+    }
+
+    if input_offset < gray.len() {
+        unsafe { gray_to_rgb_avx2(&gray[input_offset..], &mut rgb[output_offset..]) };
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,ssse3")]
+unsafe fn gray_to_rgb_avx2(gray: &[u8], rgb: &mut [u8]) {
+    let masks = unsafe { shuffle_masks() };
+
+    let mut input_offset = 0;
+    let mut output_offset = 0;
+    while input_offset + 32 <= gray.len() {
+        // Safe because the loop bounds guarantee 32 readable input bytes.
+        let pixels = unsafe { _mm256_loadu_si256(gray.as_ptr().add(input_offset).cast::<__m256i>()) };
+        unsafe { store_rgb_block_16(_mm256_castsi256_si128(pixels), &masks, rgb, output_offset) };
+        unsafe { store_rgb_block_16(
+            _mm256_extracti128_si256::<1>(pixels),
+            &masks,
+            rgb,
+            output_offset + 48,
+        ) };
+
+        input_offset += 32;
+        output_offset += 96;
+    }
+
+    if input_offset < gray.len() {
+        unsafe { gray_to_rgb_ssse3(&gray[input_offset..], &mut rgb[output_offset..]) };
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3")]
+unsafe fn gray_to_rgb_ssse3(gray: &[u8], rgb: &mut [u8]) {
+    let masks = unsafe { shuffle_masks() };
+
+    let mut input_offset = 0;
+    let mut output_offset = 0;
+    while input_offset + 16 <= gray.len() {
+        // Safe because the loop bounds guarantee 16 readable input bytes.
+        let pixels = unsafe { _mm_loadu_si128(gray.as_ptr().add(input_offset).cast::<__m128i>()) };
+        unsafe { store_rgb_block_16(pixels, &masks, rgb, output_offset) };
+
+        input_offset += 16;
+        output_offset += 48;
+    }
+
+    gray_to_rgb_tail(gray, input_offset, rgb, output_offset);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn gray_to_rgb_tail(gray: &[u8], input_offset: usize, rgb: &mut [u8], output_offset: usize) {
+    for (index, pixel) in gray[input_offset..].iter().copied().enumerate() {
+        let offset = output_offset + index * 3;
+        rgb[offset] = pixel;
+        rgb[offset + 1] = pixel;
+        rgb[offset + 2] = pixel;
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3")]
+unsafe fn shuffle_masks() -> (__m128i, __m128i, __m128i) {
+    (
+        _mm_setr_epi8(0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5),
+        _mm_setr_epi8(5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10),
+        _mm_setr_epi8(10, 11, 11, 11, 12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 15, 15),
+    )
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3")]
+unsafe fn store_rgb_block_16(
+    pixels: __m128i,
+    masks: &(__m128i, __m128i, __m128i),
+    rgb: &mut [u8],
+    output_offset: usize,
+) {
+    // Safe because output_offset always points at a full 48-byte block reserved in the RGB buffer.
+    let out_ptr = unsafe { rgb.as_mut_ptr().add(output_offset).cast::<__m128i>() };
+    let (mask0, mask1, mask2) = *masks;
+
+    // Safe because the destination buffer is pre-sized and each store writes exactly one 16-byte lane.
+    unsafe {
+        _mm_storeu_si128(out_ptr, _mm_shuffle_epi8(pixels, mask0));
+        _mm_storeu_si128(out_ptr.add(1), _mm_shuffle_epi8(pixels, mask1));
+        _mm_storeu_si128(out_ptr.add(2), _mm_shuffle_epi8(pixels, mask2));
+    }
 }
 
 fn yuyv_to_rgb(yuyv: &[u8]) -> Vec<u8> {
@@ -296,6 +468,55 @@ mod tests {
     #[test]
     fn expands_greyscale_pixels_to_rgb_triplets() {
         assert_eq!(gray_to_rgb(&[10, 20]), vec![10, 10, 10, 20, 20, 20]);
+    }
+
+    #[test]
+    fn expands_long_greyscale_input_exactly() {
+        let gray = (0_u8..32).collect::<Vec<_>>();
+        let rgb = gray_to_rgb(&gray);
+
+        assert_eq!(rgb.len(), gray.len() * 3);
+        for (index, pixel) in gray.into_iter().enumerate() {
+            let offset = index * 3;
+            assert_eq!(&rgb[offset..offset + 3], &[pixel, pixel, pixel]);
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn avx2_matches_scalar_when_available() {
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("ssse3"))
+        {
+            return;
+        }
+
+        let gray = (0_u8..65).collect::<Vec<_>>();
+        let mut expected = vec![0_u8; gray.len() * 3];
+        gray_to_rgb_scalar(&gray, &mut expected);
+        let mut actual = vec![0_u8; gray.len() * 3];
+        unsafe { gray_to_rgb_avx2(&gray, &mut actual) };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn avx512_matches_scalar_when_available() {
+        if !(std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("ssse3"))
+        {
+            return;
+        }
+
+        let gray = (0_u8..97).collect::<Vec<_>>();
+        let mut expected = vec![0_u8; gray.len() * 3];
+        gray_to_rgb_scalar(&gray, &mut expected);
+        let mut actual = vec![0_u8; gray.len() * 3];
+        unsafe { gray_to_rgb_avx512(&gray, &mut actual) };
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
