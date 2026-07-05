@@ -5,7 +5,6 @@ LIBDIR = $(PREFIX)/lib
 DATADIR = $(PREFIX)/share
 PAMDIR = $(LIBDIR)/security
 
-BUILD_DIR = ./build
 TARGET_DIR = ./target/release
 
 #----------------------------------------------------------------------------------------
@@ -16,30 +15,22 @@ RUSTFILES = Cargo.toml $(wildcard crates/**/*.rs) $(wildcard crates/**/Cargo.tom
 
 build: pam daemon check record
 
-daemon: $(BUILD_DIR)/redfaced
-pam: $(BUILD_DIR)/pam_redface.so
-check: $(BUILD_DIR)/redface-check
-record: $(BUILD_DIR)/redface-record
+daemon: $(TARGET_DIR)/redfaced
+pam: $(TARGET_DIR)/libpam_redface.so
+check: $(TARGET_DIR)/redface-check
+record: $(TARGET_DIR)/redface-record
 
-$(BUILD_DIR)/pam_redface.so: $(RUSTFILES)
+$(TARGET_DIR)/libpam_redface.so: $(RUSTFILES)
 	cargo build --release -p pam-redface
-	install -d $(BUILD_DIR)
-	install $(TARGET_DIR)/libpam_redface.so $@
 
-$(BUILD_DIR)/redfaced: $(RUSTFILES)
+$(TARGET_DIR)/redfaced: $(RUSTFILES)
 	cargo build --release -p redfaced
-	install -d $(BUILD_DIR)
-	install $(TARGET_DIR)/redfaced $@
 
-$(BUILD_DIR)/redface-check: $(RUSTFILES)
+$(TARGET_DIR)/redface-check: $(RUSTFILES)
 	cargo build --release -p redface-check
-	install -d $(BUILD_DIR)
-	install $(TARGET_DIR)/redface-check $@
 
-$(BUILD_DIR)/redface-record: $(RUSTFILES)
+$(TARGET_DIR)/redface-record: $(RUSTFILES)
 	cargo build --release -p redface-record --bin redface-record
-	install -d $(BUILD_DIR)
-	install $(TARGET_DIR)/redface-record $@
 
 #----------------------------------------------------------------------------------------
 # INSTALL
@@ -48,7 +39,7 @@ $(BUILD_DIR)/redface-record: $(RUSTFILES)
 install: install-pam install-daemon install-check install-record install-data 
 
 install-pam: pam
-	install $(BUILD_DIR)/pam_redface.so $(DESTDIR)$(PAMDIR)/pam_redface.so
+	install $(TARGET_DIR)/libpam_redface.so $(DESTDIR)$(PAMDIR)/pam_redface.so
 
 install-daemon: daemon
 	install $(BUILD_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
