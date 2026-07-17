@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 use std::num::ParseIntError;
 use std::str::FromStr;
 
-pub const DESCRIPTOR_LEN: usize = 128;
+pub const DESCRIPTOR_LEN: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Descriptor(pub [f32; DESCRIPTOR_LEN]);
@@ -36,15 +36,21 @@ impl From<io::Error> for DescriptorError {
 }
 
 impl Descriptor {
-    pub fn distance(&self, other: &Self) -> f64 {
-        self.0
-            .iter()
-            .zip(other.0.iter())
-            .map(|(left, right)| {
-                let diff = f64::from(*left) - f64::from(*right);
-                diff * diff
-            })
-            .sum()
+    /// Cosine similarity in `[-1, 1]`; higher means more similar.
+    /// Returns 0.0 when either vector has zero magnitude.
+    pub fn cosine_similarity(&self, other: &Self) -> f64 {
+        let mut dot = 0.0_f64;
+        let mut norm_self = 0.0_f64;
+        let mut norm_other = 0.0_f64;
+        for (left, right) in self.0.iter().zip(other.0.iter()) {
+            let left = f64::from(*left);
+            let right = f64::from(*right);
+            dot += left * right;
+            norm_self += left * left;
+            norm_other += right * right;
+        }
+        let denom = norm_self.sqrt() * norm_other.sqrt();
+        if denom == 0.0 { 0.0 } else { dot / denom }
     }
 
     pub fn middle(&self, other: &Self) -> Self {
@@ -248,11 +254,34 @@ mod tests {
     }
 
     #[test]
-    fn distance_matches_squared_euclidean_sum() {
-        let left = Descriptor([1.0; DESCRIPTOR_LEN]);
-        let right = Descriptor([3.0; DESCRIPTOR_LEN]);
+    fn cosine_similarity_is_one_for_identical_vectors() {
+        let value = Descriptor([1.5; DESCRIPTOR_LEN]);
 
-        assert_eq!(left.distance(&right), (DESCRIPTOR_LEN as f64) * 4.0);
+        assert!((value.cosine_similarity(&value) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cosine_similarity_is_zero_for_orthogonal_vectors() {
+        let mut left = [0.0; DESCRIPTOR_LEN];
+        let mut right = [0.0; DESCRIPTOR_LEN];
+        left[0] = 1.0;
+        right[1] = 1.0;
+
+        let similarity = Descriptor(left).cosine_similarity(&Descriptor(right));
+
+        assert!(similarity.abs() < 1e-12);
+    }
+
+    #[test]
+    fn cosine_similarity_ignores_magnitude() {
+        let mut left = [0.0; DESCRIPTOR_LEN];
+        let mut right = [0.0; DESCRIPTOR_LEN];
+        left[3] = 1.0;
+        right[3] = 7.0;
+
+        let similarity = Descriptor(left).cosine_similarity(&Descriptor(right));
+
+        assert!((similarity - 1.0).abs() < 1e-12);
     }
 
     #[test]

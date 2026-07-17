@@ -148,7 +148,7 @@ impl Camera {
         loop {
             let (raw, _) = stream.next().map_err(CaptureError::ReadFrame)?;
 
-            if active.fourcc == grey_fourcc() && !has_good_black_level(raw) {
+            if active.fourcc == grey_fourcc() && is_black_frame(raw) {
                 stats.dropped_frames += 1;
                 continue;
             }
@@ -421,14 +421,22 @@ fn yuyv_to_rgb(yuyv: &[u8]) -> Vec<u8> {
     rgb
 }
 
-fn has_good_black_level(img: &[u8]) -> bool {
+/// A GREY frame counts as black — IR illuminator off, lens covered, or
+/// exposure not yet settled — when more than half of its pixels sit near the
+/// bottom of the range. Such frames can never contain a detectable face, so
+/// they are dropped before conversion and inference. Unlike a "black level"
+/// check, a bright frame with few dark pixels is fine: close-up face frames
+/// are exactly that.
+const BLACK_PIXEL: u8 = 32;
+const BLACK_FRAME_DARK_RATIO: usize = 2;
+
+fn is_black_frame(img: &[u8]) -> bool {
     if img.is_empty() {
-        return false;
+        return true;
     }
 
-    let dark = img.iter().filter(|pixel| **pixel < 80).count();
-    let darkness = 100 * dark / img.len();
-    darkness > 5 && darkness < 95
+    let dark = img.iter().filter(|pixel| **pixel < BLACK_PIXEL).count();
+    dark * BLACK_FRAME_DARK_RATIO > img.len()
 }
 
 #[cfg(test)]
@@ -520,10 +528,31 @@ mod tests {
     }
 
     #[test]
-    fn detects_bad_black_levels_like_go_code() {
-        assert!(!has_good_black_level(&[0; 10]));
-        assert!(!has_good_black_level(&[255; 10]));
-        assert!(has_good_black_level(&[0, 0, 10, 20, 100, 120, 180, 200, 220, 255]));
+    fn detects_black_frames() {
+        // Empty input counts as black.
+        assert!(is_black_frame(&[]));
+        // Fully black frame.
+        assert!(is_black_frame(&[10; 100]));
+        // More than half of the pixels below the threshold.
+        let mut frame = vec![200_u8; 100];
+        for pixel in frame.iter_mut().take(60) {
+            *pixel = 10;
+        }
+        assert!(is_black_frame(&frame));
+    }
+
+    #[test]
+    fn keeps_bright_frames() {
+        // Uniform mid-gray close-up: no near-black pixels at all.
+        assert!(!is_black_frame(&[180; 100]));
+        // Up to half of the pixels may be dark.
+        let mut frame = vec![200_u8; 100];
+        for pixel in frame.iter_mut().take(50) {
+            *pixel = 10;
+        }
+        assert!(!is_black_frame(&frame));
+        // Fully saturated is not a *black* frame.
+        assert!(!is_black_frame(&[255; 100]));
     }
 
     #[test]

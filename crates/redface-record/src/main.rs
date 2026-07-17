@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use redface_capture::{Camera, StreamAction};
 use redface_record::{RecordEvent, RecordSession};
-use redface_recognition::Recognizer;
+use redface_recognition::{DevicePref, Recognizer};
 
 const DEFAULT_MODEL_DIR: &str = "/usr/share/redface";
 const DEFAULT_OUTPUT_FILE: &str = "capture.face";
@@ -23,7 +23,7 @@ fn main() -> ExitCode {
 
 fn main_impl() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1).collect())?;
-    let recognizer = Recognizer::new(&args.model_dir)?;
+    let mut recognizer = Recognizer::new(&args.model_dir, args.inference_device)?;
     let camera = Camera::new(&args.device);
     let mut output = File::create(&args.output_file)?;
     let mut session = RecordSession::new();
@@ -48,8 +48,8 @@ fn main_impl() -> Result<(), Box<dyn std::error::Error>> {
         for event in events {
             match event {
                 RecordEvent::NoFaceDetected => println!("\t- No face detected"),
-                RecordEvent::FaceRecorded { index, distance } => {
-                    println!("  - Face [{index}] (distance: {distance:.3})");
+                RecordEvent::FaceRecorded { index, similarity } => {
+                    println!("  - Face [{index}] (similarity: {similarity:.3})");
                 }
             }
         }
@@ -70,6 +70,7 @@ struct Args {
     device: PathBuf,
     model_dir: PathBuf,
     output_file: PathBuf,
+    inference_device: DevicePref,
 }
 
 impl Args {
@@ -77,6 +78,7 @@ impl Args {
         let mut device = None;
         let mut model_dir = PathBuf::from(DEFAULT_MODEL_DIR);
         let mut output_file = PathBuf::from(DEFAULT_OUTPUT_FILE);
+        let mut inference_device = DevicePref::default();
 
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -84,6 +86,12 @@ impl Args {
                 "--device" => device = Some(PathBuf::from(next_value(&mut iter, "--device")?)),
                 "--model-dir" => model_dir = PathBuf::from(next_value(&mut iter, "--model-dir")?),
                 "--output" => output_file = PathBuf::from(next_value(&mut iter, "--output")?),
+                "--inference-device" => {
+                    let value = next_value(&mut iter, "--inference-device")?;
+                    inference_device = DevicePref::parse(&value).map_err(|err| {
+                        io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+                    })?;
+                }
                 "-h" | "--help" => {
                     print_usage();
                     return Err(io::Error::other("help requested"));
@@ -105,6 +113,7 @@ impl Args {
             device,
             model_dir,
             output_file,
+            inference_device,
         })
     }
 }
@@ -120,7 +129,7 @@ fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Str
 
 fn print_usage() {
     println!(
-        "Usage: redface-record --device <path> [--model-dir <dir>] [--output <file>]"
+        "Usage: redface-record --device <path> [--model-dir <dir>] [--output <file>] [--inference-device <NPU|CPU|AUTO>]"
     );
 }
 
@@ -146,8 +155,35 @@ mod tests {
                 device: PathBuf::from("/dev/video0"),
                 model_dir: PathBuf::from("/models"),
                 output_file: PathBuf::from("faces.out"),
+                inference_device: DevicePref::Npu,
             }
         );
+    }
+
+    #[test]
+    fn parses_inference_device_argument() {
+        let args = Args::parse(vec![
+            "--device".into(),
+            "/dev/video0".into(),
+            "--inference-device".into(),
+            "NPU".into(),
+        ])
+        .expect("args should parse");
+
+        assert_eq!(args.inference_device, DevicePref::Npu);
+    }
+
+    #[test]
+    fn rejects_invalid_inference_device() {
+        let err = Args::parse(vec![
+            "--device".into(),
+            "/dev/video0".into(),
+            "--inference-device".into(),
+            "TPU".into(),
+        ])
+        .expect_err("invalid inference device should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

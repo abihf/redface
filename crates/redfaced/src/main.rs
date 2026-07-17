@@ -8,7 +8,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::Duration;
 
-use redface_recognition::Recognizer;
+use redface_recognition::{DevicePref, Recognizer};
 use redface_runtime::{Config, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR, VerifyOptions, read_req, to_auth_req, verify, write_error_res, write_success_res};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
@@ -22,7 +22,10 @@ fn serve() -> Result<(), Box<dyn std::error::Error>> {
         return Err("already run".into());
     }
 
-    let recognizer = Recognizer::new(DEFAULT_DATA_DIR)?;
+    let mut recognizer = Recognizer::new(
+        DEFAULT_DATA_DIR,
+        DevicePref::parse(&config.inference_device)?,
+    )?;
     let _pid_guard = PidFileGuard::create(&config.pid_file)?;
 
     let socket_path = PathBuf::from(&config.socket);
@@ -39,7 +42,7 @@ fn serve() -> Result<(), Box<dyn std::error::Error>> {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut conn, _)) => {
-                if let Err(err) = handle_connection(&recognizer, &config, &mut conn) {
+                if let Err(err) = handle_connection(&mut recognizer, &config, &mut conn) {
                     eprintln!("Connection error: {err}");
                     let _ = conn.shutdown(Shutdown::Both);
                 }
@@ -53,7 +56,7 @@ fn serve() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn handle_connection(recognizer: &Recognizer, config: &Config, conn: &mut UnixStream) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_connection(recognizer: &mut Recognizer, config: &Config, conn: &mut UnixStream) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let req = match read_req(&mut *conn) {
             Ok(req) => req,

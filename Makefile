@@ -11,7 +11,15 @@ TARGET_DIR = ./target/release
 # BUILD
 #----------------------------------------------------------------------------------------
 
-RUSTFILES = Cargo.toml $(wildcard crates/**/*.rs) $(wildcard crates/**/Cargo.toml) $(wildcard vendor/dlib-face-recognition/src/**/*.rs)
+RUSTFILES = Cargo.toml Cargo.lock $(wildcard crates/**/*.rs) $(wildcard crates/**/Cargo.toml)
+
+MODELS = data/det_10g.onnx data/w600k_r50.onnx
+BUFFALO_URL = https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
+
+fetch-data:
+	curl -sL -o /tmp/buffalo_l.zip $(BUFFALO_URL)
+	unzip -o -j /tmp/buffalo_l.zip det_10g.onnx w600k_r50.onnx -d data/
+	rm -f /tmp/buffalo_l.zip
 
 build: pam daemon check record
 
@@ -42,19 +50,19 @@ install-pam: pam
 	install $(TARGET_DIR)/libpam_redface.so $(DESTDIR)$(PAMDIR)/pam_redface.so
 
 install-daemon: daemon
-	install $(BUILD_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
+	install $(TARGET_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
 	install data/redfaced.service $(DESTDIR)$(LIBDIR)/systemd/system/redfaced.service
 
 install-check: check
-	install $(BUILD_DIR)/redface-check $(DESTDIR)$(BINDIR)/redface-check
+	install $(TARGET_DIR)/redface-check $(DESTDIR)$(BINDIR)/redface-check
 
 install-record: record
-	install $(BUILD_DIR)/redface-record $(DESTDIR)$(BINDIR)/redface-record
+	install $(TARGET_DIR)/redface-record $(DESTDIR)$(BINDIR)/redface-record
 
 install-data:
 	install -d -m 755 $(DESTDIR)$(DATADIR)/redface
-	install data/dlib_face_recognition_resnet_model_v1.dat $(DESTDIR)$(DATADIR)/redface/dlib_face_recognition_resnet_model_v1.dat
-	install data/shape_predictor_5_face_landmarks.dat $(DESTDIR)$(DATADIR)/redface/shape_predictor_5_face_landmarks.dat
+	install data/det_10g.onnx $(DESTDIR)$(DATADIR)/redface/det_10g.onnx
+	install data/w600k_r50.onnx $(DESTDIR)$(DATADIR)/redface/w600k_r50.onnx
 
 #----------------------------------------------------------------------------------------
 # CLEAN

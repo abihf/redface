@@ -6,7 +6,7 @@ use redface_recognition::Face;
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecordEvent {
     NoFaceDetected,
-    FaceRecorded { index: usize, distance: f64 },
+    FaceRecorded { index: usize, similarity: f64 },
 }
 
 #[derive(Debug, Default)]
@@ -40,12 +40,12 @@ impl RecordSession {
 
         let mut events = Vec::with_capacity(faces.len());
         for (index, face) in faces.iter().enumerate() {
-            let (distance, descriptor_to_write) = match self.aggregate {
+            let (similarity, descriptor_to_write) = match self.aggregate {
                 Some(current) => {
-                    let distance = face.descriptor.distance(&current);
+                    let similarity = face.descriptor.cosine_similarity(&current);
                     let updated = current.middle(&face.descriptor);
                     self.aggregate = Some(updated);
-                    (distance, updated)
+                    (similarity, updated)
                 }
                 None => {
                     self.aggregate = Some(face.descriptor);
@@ -55,7 +55,7 @@ impl RecordSession {
 
             descriptor_to_write.write_line(&mut writer)?;
             writer.write_all(b"\n")?;
-            events.push(RecordEvent::FaceRecorded { index, distance });
+            events.push(RecordEvent::FaceRecorded { index, similarity });
         }
 
         Ok(events)
@@ -89,13 +89,13 @@ mod tests {
             .record_faces(&[face_with_scalar(2.0)], &mut out)
             .expect("recording should succeed");
 
-        assert_eq!(events, vec![RecordEvent::FaceRecorded { index: 0, distance: 1.0 }]);
+        assert_eq!(events, vec![RecordEvent::FaceRecorded { index: 0, similarity: 1.0 }]);
         assert_eq!(String::from_utf8(out).expect("valid utf8"), format!("{}\n", Descriptor([2.0; redface_core::DESCRIPTOR_LEN]).encode_line()));
         assert_eq!(session.aggregate(), Some(&Descriptor([2.0; redface_core::DESCRIPTOR_LEN])));
     }
 
     #[test]
-    fn later_faces_use_distance_before_averaging() {
+    fn later_faces_use_similarity_before_averaging() {
         let mut session = RecordSession::new();
         let mut out = Vec::new();
         session
@@ -106,7 +106,14 @@ mod tests {
             .record_faces(&[face_with_scalar(4.0)], &mut out)
             .expect("recording should succeed");
 
-        assert_eq!(events, vec![RecordEvent::FaceRecorded { index: 0, distance: 512.0 }]);
+        // Same direction, different magnitude -> cosine similarity ~1.0.
+        match &events[..] {
+            [RecordEvent::FaceRecorded { index, similarity }] => {
+                assert_eq!(*index, 0);
+                assert!((similarity - 1.0).abs() < 1e-9, "similarity={similarity}");
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
         assert_eq!(String::from_utf8(out).expect("valid utf8"), format!("{}\n", Descriptor([3.0; redface_core::DESCRIPTOR_LEN]).encode_line()));
         assert_eq!(session.aggregate(), Some(&Descriptor([3.0; redface_core::DESCRIPTOR_LEN])));
     }

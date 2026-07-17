@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use redface_capture::{Camera, CaptureError, StreamAction};
 use redface_core::{Descriptor, DescriptorError, read_descriptors};
-use redface_recognition::{Recognizer, RecognizerError};
+use redface_recognition::{DevicePref, Recognizer, RecognizerError};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/redface/config.json";
@@ -18,6 +18,9 @@ pub const DEFAULT_MODELS_DIR: &str = "/etc/redface/models";
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub device: String,
+    /// Inference device preference: "NPU", "CPU" or "AUTO" (default "NPU").
+    pub inference_device: String,
+    /// Cosine-similarity acceptance threshold in [-1, 1]; higher is stricter.
     pub threshold: f64,
     pub timeout: u64,
     pub socket: String,
@@ -29,6 +32,7 @@ pub enum ConfigError {
     Open { path: PathBuf, source: io::Error },
     Parse { path: PathBuf, source: serde_json::Error },
     MissingDevice,
+    InvalidInferenceDevice { value: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -37,6 +41,9 @@ impl fmt::Display for ConfigError {
             Self::Open { path, source } => write!(f, "failed to open config {}: {source}", path.display()),
             Self::Parse { path, source } => write!(f, "failed to parse config {}: {source}", path.display()),
             Self::MissingDevice => write!(f, "Device not set"),
+            Self::InvalidInferenceDevice { value } => {
+                write!(f, "invalid inference_device '{value}': expected NPU, CPU or AUTO")
+            }
         }
     }
 }
@@ -46,6 +53,7 @@ impl std::error::Error for ConfigError {}
 #[derive(Clone, Debug, Default, Deserialize)]
 struct RawConfig {
     device: Option<String>,
+    inference_device: Option<String>,
     threshold: Option<f64>,
     timeout: Option<u64>,
     socket: Option<String>,
@@ -78,9 +86,15 @@ impl Config {
             return Err(ConfigError::MissingDevice);
         }
 
+        let inference_device = raw.inference_device.unwrap_or_else(|| "NPU".to_owned());
+        DevicePref::parse(&inference_device).map_err(|_| ConfigError::InvalidInferenceDevice {
+            value: inference_device.clone(),
+        })?;
+
         Ok(Self {
             device,
-            threshold: raw.threshold.unwrap_or(0.1),
+            inference_device,
+            threshold: raw.threshold.unwrap_or(0.9),
             timeout: raw.timeout.unwrap_or(10),
             socket: raw.socket.unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned()),
             pid_file: raw.pid_file.unwrap_or_else(|| DEFAULT_PID_PATH.to_owned()),
@@ -212,7 +226,7 @@ impl fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-pub fn verify(recognizer: &Recognizer, options: &VerifyOptions) -> Result<bool, VerifyError> {
+pub fn verify(recognizer: &mut Recognizer, options: &VerifyOptions) -> Result<bool, VerifyError> {
     let models = load_models(&options.model_file)?;
     let camera = Camera::new(&options.device);
     let started = Instant::now();
@@ -246,9 +260,9 @@ pub fn verify(recognizer: &Recognizer, options: &VerifyOptions) -> Result<bool, 
             for (index, face) in faces.iter().enumerate() {
                 print!("  - Face [{}]:", index);
                 for model in &models {
-                    let distance = model.distance(&face.descriptor);
-                    print!(" {:.3}", distance);
-                    if distance < options.threshold {
+                    let similarity = model.cosine_similarity(&face.descriptor);
+                    print!(" {:.3}", similarity);
+                    if similarity > options.threshold {
                         println!(" (found)");
                         matched = true;
                         return StreamAction::Stop;
@@ -295,10 +309,37 @@ mod tests {
         })
         .expect("config should parse");
 
-        assert_eq!(config.threshold, 0.1);
+        assert_eq!(config.inference_device, "NPU");
+        assert_eq!(config.threshold, 0.4);
         assert_eq!(config.timeout, 10);
         assert_eq!(config.socket, DEFAULT_SOCKET_PATH);
         assert_eq!(config.pid_file, DEFAULT_PID_PATH);
+    }
+
+    #[test]
+    fn config_rejects_invalid_inference_device() {
+        let result = Config::from_raw(RawConfig {
+            device: Some("/dev/video0".to_owned()),
+            inference_device: Some("TPU".to_owned()),
+            ..RawConfig::default()
+        });
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidInferenceDevice { .. })
+        ));
+    }
+
+    #[test]
+    fn config_accepts_npu_inference_device() {
+        let config = Config::from_raw(RawConfig {
+            device: Some("/dev/video0".to_owned()),
+            inference_device: Some("npu".to_owned()),
+            ..RawConfig::default()
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.inference_device, "npu");
     }
 
     #[test]

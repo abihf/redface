@@ -1,0 +1,203 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+
+    {
+      "name": "Debug unit tests in library 'redface_core'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--package=redface-core"
+        ]
+      }
+    },
+    {
+      "name": "Debug example 'gen_fixture'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "run",
+          "--example=gen_fixture",
+          "--package=redface-core"
+        ]
+      },
+      "args": []
+    },
+    {
+      "name": "Debug unit tests in example 'gen_fixture'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--example=gen_fixture",
+          "--package=redface-core"
+        ]
+      }
+    },
+    {
+      "name": "Debug integration test 'descriptor_compat'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--test=descriptor_compat",
+          "--package=redface-core"
+        ]
+      }
+    },
+    {
+      "name": "Debug unit tests in library 'redface_recognition'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--package=redface-recognition"
+        ]
+      }
+    },
+    {
+      "name": "Debug example 'smoke_test'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "run",
+          "--example=smoke_test",
+          "--package=redface-recognition"
+        ]
+      },
+      "args": []
+    },
+    {
+      "name": "Debug unit tests in example 'smoke_test'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--example=smoke_test",
+          "--package=redface-recognition"
+        ]
+      }
+    },
+    {
+      "name": "Debug unit tests in library 'redface_record'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--package=redface-record"
+        ]
+      }
+    },
+    {
+      "name": "Debug executable 'redface-record'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "run",
+          "--bin=redface-record",
+          "--package=redface-record",
+          "--",
+          "--device", "/dev/video2"
+        ]
+      },
+      "args": []
+    },
+    {
+      "name": "Debug unit tests in executable 'redface-record'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--bin=redface-record",
+          "--package=redface-record"
+        ]
+      }
+    },
+    {
+      "name": "Debug unit tests in library 'redface_capture'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--package=redface-capture"
+        ]
+      }
+    },
+    {
+      "name": "Debug unit tests in library 'redface_runtime'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--package=redface-runtime"
+        ]
+      }
+    },
+    {
+      "name": "Debug executable 'redfaced'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "run",
+          "--bin=redfaced",
+          "--package=redfaced"
+        ]
+      },
+      "args": []
+    },
+    {
+      "name": "Debug unit tests in executable 'redfaced'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--bin=redfaced",
+          "--package=redfaced"
+        ]
+      }
+    },
+    {
+      "name": "Debug executable 'redface-check'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "run",
+          "--bin=redface-check",
+          "--package=redface-check"
+        ]
+      },
+      "args": []
+    },
+    {
+      "name": "Debug unit tests in executable 'redface-check'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--bin=redface-check",
+          "--package=redface-check"
+        ]
+      }
+    }
+  ]
+}
