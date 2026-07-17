@@ -51,6 +51,7 @@ install-pam: pam
 
 install-daemon: daemon
 	install $(TARGET_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
+install-unit:
 	install data/redfaced.service $(DESTDIR)$(LIBDIR)/systemd/system/redfaced.service
 
 install-check: check

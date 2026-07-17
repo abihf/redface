@@ -1,10 +1,16 @@
+use std::ffi::c_void;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use opencv::core::{AlgorithmHint, BORDER_REPLICATE, CV_32F, CV_8UC3, Mat, Ptr, Scalar, Size};
+use opencv::prelude::*;
+use opencv::{dnn, imgproc};
 use openvino::{
     CompiledModel, Core, DeviceType, ElementType, InferRequest, Model, PartialShape, Shape, Tensor,
 };
 pub use redface_core::{DESCRIPTOR_LEN, Descriptor};
+
+mod simd;
 
 // Model files distributed in the InsightFace `buffalo_l` pack:
 // https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
@@ -133,6 +139,7 @@ pub struct Recognizer {
     _core: Core,
     detector: ModelRunner,
     encoder: ModelRunner,
+    clahe: Ptr<imgproc::CLAHE>,
 }
 
 impl Recognizer {
@@ -159,6 +166,7 @@ impl Recognizer {
             _core: core,
             detector,
             encoder,
+            clahe: new_clahe()?,
         })
     }
 
@@ -175,8 +183,7 @@ impl Recognizer {
         // which RGB-trained CNN detectors handle poorly. Applied before both
         // detection and encoding (the recipe Howdy and Visage use on these
         // cameras).
-        let mut img = img_data.to_vec();
-        clahe(&mut img, width as usize, height as usize);
+        let img = equalize_frame(&mut self.clahe, img_data, width as i32, height as i32)?;
 
         let detections = self.detect(&img, width as usize, height as usize)?;
 
@@ -189,7 +196,7 @@ impl Recognizer {
 
         let mut faces = Vec::with_capacity(detections.len());
         for detection in detections {
-            let crop = align_face(&img, width as usize, height as usize, &detection.landmarks);
+            let crop = align_face(&img, &detection.landmarks)?;
             let descriptor = self.encode(&crop)?;
             faces.push(Face {
                 rectangle: detection.rectangle,
@@ -202,14 +209,14 @@ impl Recognizer {
 
     fn detect(
         &mut self,
-        img_data: &[u8],
+        img: &Mat,
         width: usize,
         height: usize,
     ) -> Result<Vec<Detection>, RecognizerError> {
-        let (tensor, ratio) = detector_input(img_data, width, height);
+        let blob = detector_input(img)?;
         let input = input_tensor(
             [1, 3, DETECTOR_INPUT_SIZE as i64, DETECTOR_INPUT_SIZE as i64],
-            &tensor,
+            blob.data_typed::<f32>().map_err(inference_error)?,
         )?;
 
         self.detector
@@ -228,6 +235,7 @@ impl Recognizer {
             branch_data.push(output.get_data::<f32>().map_err(inference_error)?.to_vec());
         }
 
+        let ratio = width as f32 / DETECTOR_INPUT_SIZE as f32;
         Ok(decode_detections(&branch_data, ratio, width, height))
     }
 
@@ -342,31 +350,29 @@ struct Detection {
     landmarks: [(f32, f32); 5],
 }
 
-/// Resizes the frame to the detector's static input size (no letterbox; the
-/// camera frames are ~square, so aspect distortion is negligible) and converts
-/// to NCHW f32 normalized as (x - 127.5) / 128, per the SCRFD reference.
-fn detector_input(img_data: &[u8], width: usize, height: usize) -> (Vec<f32>, f32) {
-    let size = DETECTOR_INPUT_SIZE;
-    let mut tensor = vec![0.0_f32; 3 * size * size];
-    for y in 0..size {
-        let src_y = y * height / size;
-        for x in 0..size {
-            let src_x = x * width / size;
-            let pixel = (src_y * width + src_x) * 3;
-            let offset = y * size + x;
-            tensor[offset] = (img_data[pixel] as f32 - 127.5) / 128.0;
-            tensor[size * size + offset] = (img_data[pixel + 1] as f32 - 127.5) / 128.0;
-            tensor[2 * size * size + offset] = (img_data[pixel + 2] as f32 - 127.5) / 128.0;
-        }
-    }
-    (tensor, width as f32 / size as f32)
+/// Resizes the frame to the detector's static input size and converts to NCHW
+/// f32 normalized as (x - 127.5) / 128, per the SCRFD reference. OpenCV's
+/// blob_from_image resizes with INTER_LINEAR (the InsightFace reference
+/// preprocessing).
+fn detector_input(img: &Mat) -> Result<Mat, RecognizerError> {
+    dnn::blob_from_image(
+        img,
+        1.0 / 128.0,
+        Size::new(DETECTOR_INPUT_SIZE as i32, DETECTOR_INPUT_SIZE as i32),
+        Scalar::all(127.5),
+        false,
+        false,
+        CV_32F,
+    )
+    .map_err(inference_error)
 }
 
 /// Decodes SCRFD anchor-free outputs. `branches` holds the 9 output tensors in
 /// model order: [score8, score16, score32, bbox8, bbox16, bbox32, kps8, kps16,
 /// kps32]. Each branch has SCRFD_NUM_ANCHORS entries per feature-map point,
 /// adjacent per point. `ratio` maps model-input pixels back to original frame
-/// pixels.
+/// pixels. Scores are pre-filtered with an AVX2 scan (scalar fallback), see
+/// `simd`.
 fn decode_detections(
     branches: &[Vec<f32>],
     ratio: f32,
@@ -381,10 +387,9 @@ fn decode_detections(
         let kps = &branches[6 + level];
         let fmap = DETECTOR_INPUT_SIZE / stride;
 
-        for (index, &score) in scores.iter().enumerate() {
-            if score < DETECTOR_CONF_THRESHOLD {
-                continue;
-            }
+        for index in simd::above_threshold(scores, DETECTOR_CONF_THRESHOLD) {
+            let index = index as usize;
+            let score = scores[index];
 
             let point = index / SCRFD_NUM_ANCHORS;
             let cx = ((point % fmap) as f32) * *stride as f32;
@@ -423,95 +428,44 @@ fn decode_detections(
 
 /// CLAHE tile grid (8x8) and clip limit, the OpenCV `cv::createCLAHE()`
 /// defaults that Howdy uses on the same cameras.
-const CLAHE_GRID: usize = 8;
-const CLAHE_CLIP_LIMIT: f32 = 2.0;
+const CLAHE_GRID: i32 = 8;
+const CLAHE_CLIP_LIMIT: f64 = 2.0;
+
+fn new_clahe() -> Result<Ptr<imgproc::CLAHE>, RecognizerError> {
+    imgproc::create_clahe(CLAHE_CLIP_LIMIT, Size::new(CLAHE_GRID, CLAHE_GRID))
+        .map_err(|err| RecognizerError::Setup(err.to_string()))
+}
 
 /// Contrast-limited adaptive histogram equalization of the grayscale plane of
 /// an RGB24 buffer (gray is replicated across the 3 channels; the equalized
-/// value is written back to all three). Per-tile histograms are clipped with
-/// the excess redistributed, turned into CDF lookup tables, and applied with
-/// bilinear interpolation between tile LUTs — OpenCV's CLAHE semantics.
-fn clahe(img: &mut [u8], width: usize, height: usize) {
-    let tile_w = width / CLAHE_GRID;
-    let tile_h = height / CLAHE_GRID;
-    if tile_w == 0 || tile_h == 0 {
-        return;
+/// gray is replicated back into all three). OpenCV's CLAHE does the SIMD-heavy
+/// work.
+fn equalize_frame(
+    clahe: &mut Ptr<imgproc::CLAHE>,
+    img_data: &[u8],
+    width: i32,
+    height: i32,
+) -> Result<Mat, RecognizerError> {
+    // SAFETY: `img_data` outlives `frame`, OpenCV never frees external data,
+    // and `frame` is only used as a const cvt_color source.
+    let frame = unsafe {
+        Mat::new_rows_cols_with_data_unsafe_def(
+            height,
+            width,
+            CV_8UC3,
+            img_data.as_ptr() as *mut c_void,
+        )
     }
+    .map_err(inference_error)?;
 
-    let mut luts = vec![[0_u8; 256]; CLAHE_GRID * CLAHE_GRID];
-    for ty in 0..CLAHE_GRID {
-        for tx in 0..CLAHE_GRID {
-            let mut hist = [0_usize; 256];
-            for y in ty * tile_h..(ty + 1) * tile_h {
-                for x in tx * tile_w..(tx + 1) * tile_w {
-                    hist[img[(y * width + x) * 3] as usize] += 1;
-                }
-            }
-
-            // Clip and redistribute the excess evenly over all bins.
-            let clip = (CLAHE_CLIP_LIMIT * (tile_w * tile_h) as f32 / 256.0)
-                .round()
-                .max(1.0) as usize;
-            let mut excess = 0;
-            for bin in hist.iter_mut() {
-                if *bin > clip {
-                    excess += *bin - clip;
-                    *bin = clip;
-                }
-            }
-            let per_bin = excess / 256;
-            for bin in hist.iter_mut() {
-                *bin += per_bin;
-            }
-            // Spread the remainder evenly across the histogram (OpenCV:
-            // step = max(histSize / residual, 1)), not into the lowest bins.
-            let mut residual = excess % 256;
-            if residual > 0 {
-                let step = (256 / residual).max(1);
-                let mut index = 0;
-                while index < 256 && residual > 0 {
-                    hist[index] += 1;
-                    index += step;
-                    residual -= 1;
-                }
-            }
-
-            // CDF -> LUT, scaled so the bin totals map onto 0..=255.
-            let lut = &mut luts[ty * CLAHE_GRID + tx];
-            let mut sum = 0_usize;
-            for (value, bin) in hist.iter().enumerate() {
-                sum += bin;
-                lut[value] = (255 * sum / (tile_w * tile_h)) as u8;
-            }
-        }
-    }
-
-    // Apply, interpolating between the LUTs of the 4 nearest tile centers.
-    for y in 0..height {
-        let gy = (y as f32 + 0.5) / tile_h as f32 - 0.5;
-        let ty0 = gy.floor().clamp(0.0, (CLAHE_GRID - 1) as f32) as usize;
-        let ty1 = (ty0 + 1).min(CLAHE_GRID - 1);
-        let fy = (gy - ty0 as f32).clamp(0.0, 1.0);
-
-        for x in 0..width {
-            let gx = (x as f32 + 0.5) / tile_w as f32 - 0.5;
-            let tx0 = gx.floor().clamp(0.0, (CLAHE_GRID - 1) as f32) as usize;
-            let tx1 = (tx0 + 1).min(CLAHE_GRID - 1);
-            let fx = (gx - tx0 as f32).clamp(0.0, 1.0);
-
-            let offset = (y * width + x) * 3;
-            let value = img[offset] as usize;
-            let lut = |tx: usize, ty: usize| luts[ty * CLAHE_GRID + tx][value] as f32;
-            let equalized = (lut(tx0, ty0) * (1.0 - fx) * (1.0 - fy)
-                + lut(tx1, ty0) * fx * (1.0 - fy)
-                + lut(tx0, ty1) * (1.0 - fx) * fy
-                + lut(tx1, ty1) * fx * fy)
-                .round() as u8;
-            img[offset] = equalized;
-            img[offset + 1] = equalized;
-            img[offset + 2] = equalized;
-        }
-    }
+    let mut gray = Mat::default();
+    imgproc::cvt_color_def(&frame, &mut gray, imgproc::COLOR_RGB2GRAY).map_err(inference_error)?;
+    let mut equalized = Mat::default();
+    clahe.apply(&gray, &mut equalized).map_err(inference_error)?;
+    let mut rgb = Mat::default();
+    imgproc::cvt_color_def(&equalized, &mut rgb, imgproc::COLOR_GRAY2RGB)
+        .map_err(inference_error)?;
+    Ok(rgb)
 }
 
 fn clamp_coord(value: f32, limit: usize) -> i64 {
@@ -557,50 +511,28 @@ const ARCFACE_TEMPLATE: [(f32, f32); 5] = [
 
 /// Warps the frame to an aligned ENCODER_INPUT_SIZE² face crop in NCHW f32,
 /// BGR order, normalized (x - 127.5) / 127.5.
-fn align_face(
-    img_data: &[u8],
-    width: usize,
-    height: usize,
-    landmarks: &[(f32, f32); 5],
-) -> Vec<f32> {
-    let matrix = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
-    let inverse = invert_2x3(matrix);
+fn align_face(img: &Mat, landmarks: &[(f32, f32); 5]) -> Result<Vec<f32>, RecognizerError> {
+    let m = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
+    let matrix =
+        Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).map_err(inference_error)?;
 
-    let size = ENCODER_INPUT_SIZE;
-    let mut out = vec![0.0_f32; 3 * size * size];
-    for y in 0..size {
-        for x in 0..size {
-            let (src_x, src_y) = apply_2x3(inverse, x as f32 + 0.5, y as f32 + 0.5);
-            let (r, g, b) = bilinear_rgb(img_data, width, height, src_x, src_y);
-            let offset = y * size + x;
-            out[offset] = (b - 127.5) / 127.5; // B
-            out[size * size + offset] = (g - 127.5) / 127.5; // G
-            out[2 * size * size + offset] = (r - 127.5) / 127.5; // R
-        }
-    }
-    out
-}
+    let size = Size::new(ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32);
+    let mut crop = Mat::default();
+    imgproc::warp_affine(
+        img,
+        &mut crop,
+        &matrix,
+        size,
+        imgproc::INTER_LINEAR,
+        BORDER_REPLICATE,
+        Scalar::all(0.0),
+        AlgorithmHint::ALGO_HINT_DEFAULT,
+    )
+    .map_err(inference_error)?;
 
-/// Bilinear sample of an RGB24 buffer; out-of-bounds coordinates clamp to the
-/// nearest edge pixel.
-fn bilinear_rgb(img: &[u8], width: usize, height: usize, x: f32, y: f32) -> (f32, f32, f32) {
-    let x = x.clamp(0.0, (width - 1) as f32);
-    let y = y.clamp(0.0, (height - 1) as f32);
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(width - 1);
-    let y1 = (y0 + 1).min(height - 1);
-    let fx = x - x0 as f32;
-    let fy = y - y0 as f32;
-
-    let pick = |px: usize, py: usize, channel: usize| img[(py * width + px) * 3 + channel] as f32;
-    let sample = |channel: usize| {
-        let top = pick(x0, y0, channel) * (1.0 - fx) + pick(x1, y0, channel) * fx;
-        let bottom = pick(x0, y1, channel) * (1.0 - fx) + pick(x1, y1, channel) * fx;
-        top * (1.0 - fy) + bottom * fy
-    };
-
-    (sample(0), sample(1), sample(2))
+    let blob = dnn::blob_from_image(&crop, 1.0 / 127.5, size, Scalar::all(127.5), true, false, CV_32F)
+        .map_err(inference_error)?;
+    Ok(blob.data_typed::<f32>().map_err(inference_error)?.to_vec())
 }
 
 /// Estimates the 2D similarity transform mapping `src` landmarks to `dst`
@@ -642,23 +574,6 @@ fn similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> [f32; 6
     [a, -b, tx, b, a, ty]
 }
 
-fn invert_2x3(m: [f32; 6]) -> [f32; 6] {
-    let det = m[0] * m[4] - m[1] * m[3];
-    if det.abs() <= f32::EPSILON {
-        return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-    }
-    let inv_det = 1.0 / det;
-    let a = m[4] * inv_det;
-    let b = -m[1] * inv_det;
-    let c = -m[3] * inv_det;
-    let d = m[0] * inv_det;
-    [a, b, -(a * m[2] + b * m[5]), c, d, -(c * m[2] + d * m[5])]
-}
-
-fn apply_2x3(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
-    (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5])
-}
-
 fn validate_rgb_buffer(width: u32, height: u32, actual_len: usize) -> Result<(), RecognizerError> {
     let expected_len = (width as usize)
         .checked_mul(height as usize)
@@ -685,6 +600,7 @@ fn validate_rgb_buffer(width: u32, height: u32, actual_len: usize) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opencv::core::Vec3b;
 
     #[test]
     fn rejects_wrong_rgb_buffer_length() {
@@ -713,17 +629,19 @@ mod tests {
 
     #[test]
     fn clahe_keeps_flat_image_flat() {
-        let mut img = vec![128u8; 32 * 32 * 3];
+        let mut clahe = new_clahe().expect("clahe");
+        let img = vec![128u8; 32 * 32 * 3];
 
-        clahe(&mut img, 32, 32);
+        let out = equalize_frame(&mut clahe, &img, 32, 32).expect("equalize");
+        let pixels = out.data_typed::<Vec3b>().expect("pixels");
 
-        assert!(img.iter().all(|&v| v == img[0]));
+        assert!(pixels.iter().all(|pixel| *pixel == pixels[0]));
     }
 
     #[test]
     fn clahe_expands_low_contrast_range() {
         // Pseudo-random noise squeezed into [100, 140], like a low-contrast
-        // IR frame. Matches the python-verified reference: spread 40 -> >100.
+        // IR frame.
         let size = 340;
         let mut img = vec![0u8; size * size * 3];
         for index in 0..size * size {
@@ -733,27 +651,30 @@ mod tests {
                 img[index * 3 + channel] = value;
             }
         }
+        let mut clahe = new_clahe().expect("clahe");
 
-        clahe(&mut img, size, size);
+        let out = equalize_frame(&mut clahe, &img, size as i32, size as i32).expect("equalize");
+        let pixels = out.data_typed::<Vec3b>().expect("pixels");
 
-        let gray: Vec<u8> = img.chunks_exact(3).map(|pixel| pixel[0]).collect();
-        let min = *gray.iter().min().unwrap();
-        let max = *gray.iter().max().unwrap();
+        let min = pixels.iter().map(|pixel| pixel[0]).min().unwrap();
+        let max = pixels.iter().map(|pixel| pixel[0]).max().unwrap();
         assert!(max - min > 90, "expected range expansion, got {min}..{max}");
         // Channels stay replicated.
-        assert!(
-            img.chunks_exact(3)
-                .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
-        );
+        assert!(pixels.iter().all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2]));
     }
 
     #[test]
     fn detector_input_normalizes_and_resizes() {
         // 2x2 image, pixels chosen so channels differ.
-        let img = [255u8, 0, 0, 0, 255, 0, 0, 0, 255, 127, 127, 127];
-        let (tensor, ratio) = detector_input(&img, 2, 2);
+        let img = Mat::from_slice_2d(&[
+            [Vec3b::from([255, 0, 0]), Vec3b::from([0, 255, 0])],
+            [Vec3b::from([0, 0, 255]), Vec3b::from([127, 127, 127])],
+        ])
+        .expect("mat");
 
-        assert!((ratio - 2.0 / 640.0).abs() < 1e-6);
+        let blob = detector_input(&img).expect("blob");
+        let tensor = blob.data_typed::<f32>().expect("blob data");
+
         let size = DETECTOR_INPUT_SIZE;
         // Top-left of the resized tensor maps to source pixel (0,0): R=255.
         assert!((tensor[0] - (255.0 - 127.5) / 128.0).abs() < 1e-4);
@@ -848,12 +769,17 @@ mod tests {
         assert_eq!(kept[1].rectangle.left, 500);
     }
 
+    /// 2x3 row-major affine application, for transform assertions.
+    fn apply(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
+        (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5])
+    }
+
     #[test]
     fn similarity_transform_identity_when_src_equals_dst() {
         let points = [(10.0, 10.0), (50.0, 12.0), (30.0, 40.0), (15.0, 60.0), (45.0, 58.0)];
         let m = similarity_transform(&points, &points);
 
-        let (x, y) = apply_2x3(m, 25.0, 33.0);
+        let (x, y) = apply(m, 25.0, 33.0);
         assert!((x - 25.0).abs() < 1e-3, "x={x}");
         assert!((y - 33.0).abs() < 1e-3, "y={y}");
     }
@@ -869,7 +795,7 @@ mod tests {
 
         let m = similarity_transform(&src, &dst);
         for (s, d) in src.iter().zip(dst.iter()) {
-            let (x, y) = apply_2x3(m, s.0, s.1);
+            let (x, y) = apply(m, s.0, s.1);
             assert!((x - d.0).abs() < 1e-3, "x={x} expected {}", d.0);
             assert!((y - d.1).abs() < 1e-3, "y={y} expected {}", d.1);
         }
@@ -888,38 +814,16 @@ mod tests {
 
         let m = similarity_transform(&src, &dst);
         for (s, d) in src.iter().zip(dst.iter()) {
-            let (x, y) = apply_2x3(m, s.0, s.1);
+            let (x, y) = apply(m, s.0, s.1);
             assert!((x - d.0).abs() < 1e-3, "x={x} expected {}", d.0);
             assert!((y - d.1).abs() < 1e-3, "y={y} expected {}", d.1);
         }
     }
 
     #[test]
-    fn invert_2x3_round_trips() {
-        let m = [2.0, 0.5, 3.0, -0.5, 2.0, -4.0];
-        let inv = invert_2x3(m);
-        let (x, y) = apply_2x3(m, 7.0, 11.0);
-        let (orig_x, orig_y) = apply_2x3(inv, x, y);
-        assert!((orig_x - 7.0).abs() < 1e-3);
-        assert!((orig_y - 11.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn bilinear_samples_exact_pixel_centers() {
-        // 2x1 image: black, white.
-        let img = [0u8, 0, 0, 255, 255, 255];
-        let (r, g, b) = bilinear_rgb(&img, 2, 1, 0.0, 0.0);
-        assert_eq!((r, g, b), (0.0, 0.0, 0.0));
-        let (r, g, b) = bilinear_rgb(&img, 2, 1, 1.0, 0.0);
-        assert_eq!((r, g, b), (255.0, 255.0, 255.0));
-        // Midpoint blends.
-        let (r, ..) = bilinear_rgb(&img, 2, 1, 0.5, 0.0);
-        assert!((r - 127.5).abs() < 1e-3);
-    }
-
-    #[test]
     fn align_face_output_shape_and_range() {
-        let img = vec![128u8; 340 * 340 * 3];
+        let img = Mat::new_rows_cols_with_default(340, 340, CV_8UC3, Scalar::all(128.0))
+            .expect("mat");
         let landmarks = [
             (120.0, 140.0),
             (220.0, 140.0),
@@ -927,7 +831,8 @@ mod tests {
             (130.0, 250.0),
             (210.0, 250.0),
         ];
-        let crop = align_face(&img, 340, 340, &landmarks);
+
+        let crop = align_face(&img, &landmarks).expect("align");
 
         assert_eq!(crop.len(), 3 * ENCODER_INPUT_SIZE * ENCODER_INPUT_SIZE);
         // Uniform gray input -> every normalized value is (128-127.5)/127.5.

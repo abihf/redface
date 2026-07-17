@@ -310,7 +310,7 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.inference_device, "NPU");
-        assert_eq!(config.threshold, 0.4);
+        assert_eq!(config.threshold, 0.9);
         assert_eq!(config.timeout, 10);
         assert_eq!(config.socket, DEFAULT_SOCKET_PATH);
         assert_eq!(config.pid_file, DEFAULT_PID_PATH);

@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 openvino = "0.11"
+# clang-runtime: v4l2-sys-mit's bindgen pulls clang-sys with the hard
+# `runtime` feature; without this the opencv build script panics under
+# workspace-wide feature unification.
+opencv = { version = "0.99", default-features = false, features = ["imgproc", "dnn", "clang-runtime"] }
 redface-core = { workspace = true }
 
 [lib]

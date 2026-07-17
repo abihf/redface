@@ -3,6 +3,8 @@ use std::io::{self, BufRead, Write};
 use std::num::ParseIntError;
 use std::str::FromStr;
 
+mod simd;
+
 pub const DESCRIPTOR_LEN: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,16 +41,7 @@ impl Descriptor {
     /// Cosine similarity in `[-1, 1]`; higher means more similar.
     /// Returns 0.0 when either vector has zero magnitude.
     pub fn cosine_similarity(&self, other: &Self) -> f64 {
-        let mut dot = 0.0_f64;
-        let mut norm_self = 0.0_f64;
-        let mut norm_other = 0.0_f64;
-        for (left, right) in self.0.iter().zip(other.0.iter()) {
-            let left = f64::from(*left);
-            let right = f64::from(*right);
-            dot += left * right;
-            norm_self += left * left;
-            norm_other += right * right;
-        }
+        let (dot, norm_self, norm_other) = simd::dot_and_norms(&self.0, &other.0);
         let denom = norm_self.sqrt() * norm_other.sqrt();
         if denom == 0.0 { 0.0 } else { dot / denom }
     }
