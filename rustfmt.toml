@@ -1,0 +1,7 @@
+# Workspace Rust formatting defaults.
+edition = "2024"
+max_width = 120
+hard_tabs = true
+newline_style = "Unix"
+use_small_heuristics = "Default"
+reorder_imports = true
