@@ -43,8 +43,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			Ok((mut conn, _)) => {
 				if let Err(err) = handle_connection(&mut recognizer, &config, &mut conn) {
 					eprintln!("Connection error: {err}");
-					let _ = conn.shutdown(Shutdown::Both);
 				}
+				let _ = conn.shutdown(Shutdown::Both);
 			}
 			Err(err) if err.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(100)),
 			Err(err) => return Err(Box::new(err)),
@@ -60,40 +60,39 @@ fn handle_connection(
 	config: &Config,
 	conn: &mut UnixStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-	loop {
-		let req = match read_req(&mut *conn) {
-			Ok(req) => req,
-			Err(err) if err.is_eof() => return Ok(()),
-			Err(err) => return Err(Box::new(err)),
-		};
+	let req = match read_req(&mut *conn) {
+		Ok(req) => req,
+		Err(err) if err.is_eof() => return Ok(()),
+		Err(err) => return Err(Box::new(err)),
+	};
 
-		match req.action {
-			redface_runtime::Action::Authenticate => {
-				let auth_req = to_auth_req(&req);
-				println!("Authorizing {}", auth_req.user);
+	match req.action {
+		redface_runtime::Action::Authenticate => {
+			let auth_req = to_auth_req(&req);
+			println!("Authorizing {}", auth_req.user);
 
-				let model_file = Path::new(DEFAULT_MODELS_DIR).join(format!("{}.face", auth_req.user));
-				let success = verify(
-					recognizer,
-					&VerifyOptions {
-						device: PathBuf::from(&config.device),
-						face_file: model_file,
-						timeout: Duration::from_secs(config.timeout),
-						threshold: config.threshold,
-					},
-				);
+			let model_file = Path::new(DEFAULT_MODELS_DIR).join(format!("{}.face", auth_req.user));
+			let success = verify(
+				recognizer,
+				&VerifyOptions {
+					device: PathBuf::from(&config.device),
+					face_file: model_file,
+					timeout: Duration::from_secs(config.timeout),
+					threshold: config.threshold,
+				},
+			);
 
-				match success {
-					Ok(true) => write_success_res(&mut *conn, std::collections::BTreeMap::new())?,
-					Ok(false) => {
-						let err = io::Error::other("face not recognized");
-						write_error_res(&mut *conn, &err)?;
-					}
-					Err(err) => write_error_res(&mut *conn, &err)?,
+			match success {
+				Ok(true) => write_success_res(&mut *conn, std::collections::BTreeMap::new())?,
+				Ok(false) => {
+					let err = io::Error::other("face not recognized");
+					write_error_res(&mut *conn, &err)?;
 				}
+				Err(err) => write_error_res(&mut *conn, &err)?,
 			}
 		}
-	}
+	};
+	Ok(())
 }
 
 fn is_already_running(path: &str) -> bool {
