@@ -4,12 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-openvino = "0.11"
+openvino = { version = "0.11", optional = true }
 # clang-runtime: v4l2-sys-mit's bindgen pulls clang-sys with the hard
 # `runtime` feature; without this the opencv build script panics under
 # workspace-wide feature unification.
 opencv = { version = "0.99", default-features = false, features = ["imgproc", "dnn", "clang-runtime"] }
 redface-core = { workspace = true }
+
+# Default builds run inference on OpenCV's DNN CPU backend with no OpenVINO
+# dependency. The opt-in `openvino` feature runs inference through OpenVINO
+# instead (NPU with CPU fallback).
+[features]
+openvino = ["dep:openvino"]
 
 [lib]
 path = "src/lib.rs"

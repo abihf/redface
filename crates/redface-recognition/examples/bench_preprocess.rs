@@ -1,7 +1,8 @@
 // Benchmark: times recognize() on a blank 340x340 frame, which exercises the
 // full preprocessing path (CLAHE, detector input, decode) plus detector
 // inference. Run: cargo run --release -p redface-recognition --example bench_preprocess
-// DEVICE=CPU selects the OpenVINO device, ITERATIONS overrides the count.
+// DEVICE only selects the OpenVINO device when built with --features openvino;
+// the default OpenCV DNN CPU backend ignores it. ITERATIONS overrides the count.
 use std::time::Instant;
 
 use redface_recognition::{DevicePref, Recognizer};

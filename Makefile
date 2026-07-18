@@ -7,6 +7,13 @@ PAMDIR = $(LIBDIR)/security
 
 TARGET_DIR = ./target/release
 
+ENABLE_OPENVINO ?= 0
+
+OPENVINO_ARGS = 
+ifeq ($(ENABLE_OPENVINO),1)
+	OPENVINO_ARGS = --features=openvino
+endif
+
 #----------------------------------------------------------------------------------------
 # BUILD
 #----------------------------------------------------------------------------------------
@@ -29,16 +36,16 @@ check: $(TARGET_DIR)/redface-check
 record: $(TARGET_DIR)/redface-record
 
 $(TARGET_DIR)/libpam_redface.so: $(RUSTFILES)
-	cargo build --release -p pam-redface
+	cargo build --release -p pam-redface $(OPENVINO_ARGS)
 
 $(TARGET_DIR)/redfaced: $(RUSTFILES)
-	cargo build --release -p redfaced
+	cargo build --release -p redfaced $(OPENVINO_ARGS)
 
 $(TARGET_DIR)/redface-check: $(RUSTFILES)
-	cargo build --release -p redface-check
+	cargo build --release -p redface-check $(OPENVINO_ARGS)
 
 $(TARGET_DIR)/redface-record: $(RUSTFILES)
-	cargo build --release -p redface-record --bin redface-record
+	cargo build --release -p redface-record --bin redface-record $(OPENVINO_ARGS)
 
 #----------------------------------------------------------------------------------------
 # INSTALL
@@ -51,6 +58,7 @@ install-pam: pam
 
 install-daemon: daemon
 	install $(TARGET_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
+
 install-unit:
 	install data/redfaced.service $(DESTDIR)$(LIBDIR)/systemd/system/redfaced.service
 
@@ -70,7 +78,7 @@ install-data:
 #----------------------------------------------------------------------------------------
 
 clean:
-	rm -f build/pam_redface.so
-	rm -f build/redfaced
-	rm -f build/redface-check
-	rm -f build/redface-record
+	rm -f $(TARGET_DIR)/pam_redface.so
+	rm -f $(TARGET_DIR)/redfaced
+	rm -f $(TARGET_DIR)/redface-check
+	rm -f $(TARGET_DIR)/redface-record

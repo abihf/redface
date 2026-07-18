@@ -7,7 +7,7 @@ This is my work-in-progress project to enable face recognition based pam authent
 [Wiki](https://github.com/abihf/redface/wiki)
 
 ## How it works
-Face recognition runs fully on ONNX models via the [`openvino`](https://crates.io/crates/openvino) crate (OpenVINO Runtime):
+Face recognition runs fully on ONNX models, via OpenCV's DNN CPU backend by default, or the [`openvino`](https://crates.io/crates/openvino) crate (OpenVINO Runtime) with the opt-in `openvino` cargo feature:
 
 1. **Preprocessing** — IR frames are contrast-normalized with OpenCV CLAHE (8x8 tiles, clip limit 2.0); raw IR frames are too low-contrast for RGB-trained models.
 2. **Detection** — `det_10g.onnx` (SCRFD-10G, InsightFace) finds faces and 5-point landmarks.
@@ -17,7 +17,7 @@ Face recognition runs fully on ONNX models via the [`openvino`](https://crates.i
 Authentication compares descriptors with **cosine similarity** (`threshold` in `/etc/redface/config.json`, default `0.9`, higher = stricter).
 
 ### Inference device
-The `inference_device` config option (and `redface-record --inference-device`) selects the OpenVINO device:
+The `inference_device` config option (and `redface-record --inference-device`) selects the OpenVINO device in an `openvino`-feature build (in a default build every value runs on the OpenCV DNN CPU backend):
 
 | Value | Behavior |
 |-------|----------|
@@ -25,7 +25,15 @@ The `inference_device` config option (and `redface-record --inference-device`) s
 | `CPU` | OpenVINO `CPU` device; works on any x86-64 |
 | `AUTO` | Alias for `NPU` (config compatibility). We avoid OpenVINO's `AUTO:NPU,CPU` meta-plugin on purpose: a broken NPU plugin install segfaults inside AUTO instead of returning a catchable error, which would defeat the CPU fallback |
 
-The `openvino` crate links against the system OpenVINO Runtime (`libopenvino_c`) at build time, so the `openvino` package must be installed to build. Pixel processing (CLAHE, resize, alignment warp) uses the `opencv` crate, which needs the system `opencv` package and `clang` (libclang) for binding generation. For NPU inference you additionally need `openvino-intel-npu-plugin` and the `intel-npu-driver` kernel driver.
+Pixel processing (CLAHE, resize, alignment warp) uses the `opencv` crate, which needs the system `opencv` package and `clang` (libclang) for binding generation. A default build has no OpenVINO dependency; opting into the `openvino` cargo feature makes the `openvino` crate link against the system OpenVINO Runtime (`libopenvino_c`) at build time, so the `openvino` package must be installed for that build. For NPU inference (OpenVINO build) you additionally need `openvino-intel-npu-plugin` and the `intel-npu-driver` kernel driver.
+
+To build with OpenVINO, opt into the cargo feature:
+
+```sh
+cargo build --workspace --features openvino
+```
+
+In a default build, inference runs on OpenCV's DNN CPU backend for every `inference_device` value (a startup message on stderr notes the backend). The DNN backend is CPU-only — no NPU — and typically 2-5x slower than OpenVINO CPU, so the `openvino` build is preferable when OpenVINO is available. Enrollment and verification should use the same backend for consistent descriptors.
 
 Note that the CLAHE preprocessing shifts descriptors: re-enroll with `redface-record` after upgrading to a build that changes preprocessing (e.g. the switch to OpenCV-based CLAHE/resize/alignment).
 

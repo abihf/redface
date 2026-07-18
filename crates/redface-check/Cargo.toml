@@ -10,3 +10,6 @@ libc = { workspace = true }
 [[bin]]
 name = "redface-check"
 path = "src/main.rs"
+
+[features]
+openvino = ["redface-runtime/openvino"]

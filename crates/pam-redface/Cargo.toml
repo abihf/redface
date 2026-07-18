@@ -12,3 +12,6 @@ users = "0.11"
 name = "pam_redface"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
+
+[features]
+openvino = ["redface-runtime/openvino"]

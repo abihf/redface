@@ -12,3 +12,6 @@ serde_json = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+openvino = ["redface-recognition/openvino"]

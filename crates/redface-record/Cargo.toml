@@ -15,3 +15,6 @@ path = "src/lib.rs"
 name = "redface-record"
 path = "src/main.rs"
 
+[features]
+openvino = ["redface-recognition/openvino"]
+

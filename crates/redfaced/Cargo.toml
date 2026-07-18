@@ -7,9 +7,12 @@ edition = "2024"
 redface-recognition = { workspace = true }
 redface-runtime = { workspace = true }
 libc = { workspace = true }
-signal-hook = "0.3"
+signal-hook = "0.4.4"
 sd-notify = "0.5"
 
 [[bin]]
 name = "redfaced"
 path = "src/main.rs"
+
+[features]
+openvino = ["redface-recognition/openvino", "redface-runtime/openvino"]
