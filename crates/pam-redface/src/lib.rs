@@ -9,7 +9,7 @@ use pam::constants::{PAM_ERROR_MSG, PAM_TEXT_INFO, PamFlag, PamResultCode};
 use pam::conv::Conv;
 use pam::module::{PamHandle, PamHooks};
 use redface_runtime::{Config, Status, read_res, write_auth_req};
-use users::os::unix::UserExt;
+use uzers::os::unix::UserExt;
 
 struct RedfacePam;
 pam::pam_hooks!(RedfacePam);
@@ -44,7 +44,7 @@ fn authenticate(pamh: &mut PamHandle, args: Vec<&CStr>) -> PamResultCode {
 		Ok(user) => user,
 		Err(err) => return err,
 	};
-	let user = match users::get_user_by_name(&user_name) {
+	let user = match uzers::get_user_by_name(&user_name) {
 		Some(user) => user,
 		None => return PamResultCode::PAM_USER_UNKNOWN,
 	};
@@ -109,7 +109,7 @@ fn parse_args(args: Vec<&CStr>) -> BTreeMap<String, String> {
 		.collect()
 }
 
-fn render_user_template(template: &str, user: &users::User) -> String {
+fn render_user_template(template: &str, user: &uzers::User) -> String {
 	let mut rendered = template.to_owned();
 	let replacements = [
 		("{{.Uid}}", user.uid().to_string()),
