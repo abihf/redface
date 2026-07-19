@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use opencv::core::{AlgorithmHint, BORDER_REPLICATE, CV_8UC3, CV_32F, Mat, Ptr, Scalar, Size};
+use opencv::core::{AlgorithmHint, BORDER_REPLICATE, CV_8UC1, CV_32F, Mat, Ptr, Scalar, Size};
 use opencv::prelude::*;
 use opencv::{dnn, imgproc};
 #[cfg(feature = "openvino")]
@@ -146,15 +146,17 @@ enum ModelRunner {
 	#[cfg(not(feature = "openvino"))]
 	Dnn {
 		net: dnn::Net,
-		out_names: Vec<String>,
+		out_names: opencv::core::Vector<String>,
 		detector: bool,
 	},
 }
 
 impl ModelRunner {
 	/// Runs one forward pass on the NCHW f32 blob and returns the model's
-	/// outputs as f32 vectors in canonical branch order.
-	fn infer(&mut self, input: &Mat) -> Result<Vec<Vec<f32>>, RecognizerError> {
+	/// output Mats in canonical branch order. On the DNN backend the Mats
+	/// come straight from `net.forward()` (zero-copy); on OpenVINO the
+	/// tensor data is copied into Mats.
+	fn infer(&mut self, input: &Mat) -> Result<Vec<Mat>, RecognizerError> {
 		match self {
 			#[cfg(feature = "openvino")]
 			Self::OpenVino {
@@ -172,7 +174,11 @@ impl ModelRunner {
 				let mut outputs = Vec::with_capacity(*num_outputs);
 				for index in 0..*num_outputs {
 					let output = request.get_output_tensor_by_index(index).map_err(inference_error)?;
-					outputs.push(output.get_data::<f32>().map_err(inference_error)?.to_vec());
+					let data = output.get_data::<f32>().map_err(inference_error)?;
+					let mut mat = Mat::new_rows_cols_with_default(1, data.len() as i32, CV_32F, Scalar::default())
+						.map_err(inference_error)?;
+					mat.data_typed_mut::<f32>().map_err(inference_error)?.copy_from_slice(data);
+					outputs.push(mat);
 				}
 				Ok(outputs)
 			}
@@ -184,27 +190,22 @@ impl ModelRunner {
 			} => {
 				net.set_input(input, "", 1.0, Scalar::default())
 					.map_err(inference_error)?;
-				let names = opencv::core::Vector::from_iter(out_names.iter().map(String::as_str));
 				let mut mats = opencv::core::Vector::<Mat>::new();
 				let mut output_array =
 					opencv::core::_OutputArray::from_mat_vec_mut(&mut mats).map_err(inference_error)?;
-				net.forward(&mut output_array, &names).map_err(inference_error)?;
+				net.forward(&mut output_array, out_names).map_err(inference_error)?;
 
 				if *detector {
-					canonical_detector_order(&mats.iter().collect::<Vec<_>>())
+					canonical_detector_order(mats)
 				} else {
-					let mut outputs = Vec::with_capacity(mats.len());
-					for mat in mats.iter() {
-						outputs.push(mat.data_typed::<f32>().map_err(inference_error)?.to_vec());
-					}
-					Ok(outputs)
+					Ok(mats.into_iter().collect())
 				}
 			}
 		}
 	}
 }
 
-/// Runs SCRFD detection + ArcFace encoding on RGB24 frames. Inference backend
+/// Runs SCRFD detection + ArcFace encoding on grayscale frames. Inference backend
 /// depends on the build: OpenCV DNN on CPU by default, OpenVINO (honoring
 /// `DevicePref`) with the opt-in `openvino` feature.
 pub struct Recognizer {
@@ -214,6 +215,10 @@ pub struct Recognizer {
 	detector: ModelRunner,
 	encoder: ModelRunner,
 	clahe: Ptr<imgproc::CLAHE>,
+	// Reusable buffers to avoid per-frame allocations in the hot path.
+	equalized: Mat,
+	rgb: Mat,
+	crop: Mat,
 }
 
 impl Recognizer {
@@ -246,6 +251,9 @@ impl Recognizer {
 				detector,
 				encoder,
 				clahe: new_clahe()?,
+				equalized: Mat::default(),
+				rgb: Mat::default(),
+				crop: Mat::default(),
 			})
 		}
 
@@ -260,6 +268,9 @@ impl Recognizer {
 				detector,
 				encoder,
 				clahe: new_clahe()?,
+				equalized: Mat::default(),
+				rgb: Mat::default(),
+				crop: Mat::default(),
 			})
 		}
 	}
@@ -271,15 +282,15 @@ impl Recognizer {
 		height: u32,
 		max_faces: usize,
 	) -> Result<Vec<Face>, RecognizerError> {
-		validate_rgb_buffer(width, height, img_data.len())?;
+		validate_gray_buffer(width, height, img_data.len())?;
 
 		// CLAHE contrast normalization: raw IR frames are often low-contrast,
 		// which RGB-trained CNN detectors handle poorly. Applied before both
 		// detection and encoding (the recipe Howdy and Visage use on these
 		// cameras).
-		let img = equalize_frame(&mut self.clahe, img_data, width as i32, height as i32)?;
+		self.equalize_frame(img_data, width as i32, height as i32)?;
 
-		let detections = self.detect(&img, width as usize, height as usize)?;
+		let detections = self.detect(width as usize, height as usize)?;
 
 		if detections.is_empty() {
 			return Ok(Vec::new());
@@ -290,8 +301,7 @@ impl Recognizer {
 
 		let mut faces = Vec::with_capacity(detections.len());
 		for detection in detections {
-			let crop = align_face(&img, &detection.landmarks)?;
-			let descriptor = self.encode(&crop)?;
+			let descriptor = self.encode(&detection.landmarks)?;
 			faces.push(Face {
 				rectangle: detection.rectangle,
 				descriptor,
@@ -301,25 +311,32 @@ impl Recognizer {
 		Ok(faces)
 	}
 
-	fn detect(&mut self, img: &Mat, width: usize, height: usize) -> Result<Vec<Detection>, RecognizerError> {
-		let blob = detector_input(img)?;
-		let branch_data = self.detector.infer(&blob)?;
-		if branch_data.len() != 9 {
+	fn detect(&mut self, width: usize, height: usize) -> Result<Vec<Detection>, RecognizerError> {
+		let blob = self.detector_input()?;
+		let branch_mats = self.detector.infer(&blob)?;
+		if branch_mats.len() != 9 {
 			return Err(RecognizerError::Inference(format!(
 				"detector returned {} outputs, expected 9",
-				branch_data.len()
+				branch_mats.len()
 			)));
 		}
 
+		let mut branches: Vec<&[f32]> = Vec::with_capacity(9);
+		for mat in &branch_mats {
+			branches.push(mat.data_typed::<f32>().map_err(inference_error)?);
+		}
+
 		let ratio = width as f32 / DETECTOR_INPUT_SIZE as f32;
-		Ok(decode_detections(&branch_data, ratio, width, height))
+		Ok(decode_detections(&branches, ratio, width, height))
 	}
 
-	fn encode(&mut self, crop: &Mat) -> Result<Descriptor, RecognizerError> {
-		let outputs = self.encoder.infer(crop)?;
-		let embedding = outputs
+	fn encode(&mut self, landmarks: &[(f32, f32); 5]) -> Result<Descriptor, RecognizerError> {
+		let crop = self.align_face(landmarks)?;
+		let outputs = self.encoder.infer(&crop)?;
+		let mat = outputs
 			.first()
 			.ok_or_else(|| RecognizerError::Inference("encoder returned no outputs".to_owned()))?;
+		let embedding = mat.data_typed::<f32>().map_err(inference_error)?;
 
 		if embedding.len() != DESCRIPTOR_LEN {
 			return Err(RecognizerError::Inference(format!(
@@ -331,6 +348,62 @@ impl Recognizer {
 		let mut descriptor = [0.0_f32; DESCRIPTOR_LEN];
 		descriptor.copy_from_slice(embedding);
 		Ok(Descriptor(descriptor))
+	}
+
+	/// Resizes the frame to the detector's static input size and converts to NCHW
+	/// f32 normalized as (x - 127.5) / 128, per the SCRFD reference. OpenCV's
+	/// blob_from_image resizes with INTER_LINEAR (the InsightFace reference
+	/// preprocessing).
+	fn detector_input(&mut self) -> Result<Mat, RecognizerError> {
+		dnn::blob_from_image(
+			&self.rgb,
+			1.0 / 128.0,
+			Size::new(DETECTOR_INPUT_SIZE as i32, DETECTOR_INPUT_SIZE as i32),
+			Scalar::all(127.5),
+			false,
+			false,
+			CV_32F,
+		)
+		.map_err(inference_error)
+	}
+
+	/// Warps the frame to an aligned ENCODER_INPUT_SIZE² face crop, returned as an
+	/// NCHW f32 blob Mat, BGR order, normalized (x - 127.5) / 127.5.
+	fn align_face(&mut self, landmarks: &[(f32, f32); 5]) -> Result<Mat, RecognizerError> {
+		let m = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
+		let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]])
+			.map_err(inference_error)?;
+
+		let size = Size::new(ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32);
+		imgproc::warp_affine(
+			&self.rgb,
+			&mut self.crop,
+			&matrix,
+			size,
+			imgproc::INTER_LINEAR,
+			BORDER_REPLICATE,
+			Scalar::all(0.0),
+			AlgorithmHint::ALGO_HINT_DEFAULT,
+		)
+		.map_err(inference_error)?;
+
+		dnn::blob_from_image(&self.crop, 1.0 / 127.5, size, Scalar::all(127.5), true, false, CV_32F)
+			.map_err(inference_error)
+	}
+
+	/// Contrast-limited adaptive histogram equalization of a grayscale frame.
+	/// The equalized gray is replicated to three channels for the models.
+	/// OpenCV's CLAHE does the SIMD-heavy work.
+	fn equalize_frame(&mut self, img_data: &[u8], width: i32, height: i32) -> Result<(), RecognizerError> {
+		// SAFETY: `img_data` outlives `frame`, OpenCV never frees external data,
+		// and `frame` is only used as a const CLAHE source.
+		let frame =
+			unsafe { Mat::new_rows_cols_with_data_unsafe_def(height, width, CV_8UC1, img_data.as_ptr() as *mut c_void) }
+				.map_err(inference_error)?;
+
+		self.clahe.apply(&frame, &mut self.equalized).map_err(inference_error)?;
+		imgproc::cvt_color_def(&self.equalized, &mut self.rgb, imgproc::COLOR_GRAY2RGB).map_err(inference_error)?;
+		Ok(())
 	}
 }
 
@@ -397,15 +470,14 @@ fn build_dnn_runner(path: &Path, detector: bool) -> Result<ModelRunner, Recogniz
 	net.set_preferable_backend(dnn::DNN_BACKEND_OPENCV)
 		.map_err(model_error)?;
 
-	let out_names: Vec<String> = net
+	let out_names = net
 		.get_unconnected_out_layers_names()
-		.map_err(model_error)?
-		.iter()
-		.collect();
+		.map_err(model_error)?;
 	if detector && out_names.len() != 9 {
+		let names: Vec<String> = out_names.iter().collect();
 		return Err(RecognizerError::ModelLoad {
 			path: path.to_path_buf(),
-			message: format!("expected 9 outputs, got: {}", out_names.join(", ")),
+			message: format!("expected 9 outputs, got: {}", names.join(", ")),
 		});
 	}
 
@@ -424,16 +496,13 @@ fn build_dnn_runner(path: &Path, detector: bool) -> Result<ModelRunner, Recogniz
 /// feature-map point identifying the stride and width identifying the kind
 /// (1 score / 4 bbox / 10 kps values).
 #[cfg(not(feature = "openvino"))]
-fn canonical_detector_order(mats: &[Mat]) -> Result<Vec<Vec<f32>>, RecognizerError> {
-	let mut slots: [Option<Vec<f32>>; 9] = Default::default();
+fn canonical_detector_order(mats: opencv::core::Vector<Mat>) -> Result<Vec<Mat>, RecognizerError> {
+	let mut slots: [Option<Mat>; 9] = Default::default();
 	for mat in mats {
 		let index = detector_branch_index(&mat.mat_size()).ok_or_else(|| {
 			RecognizerError::Inference(format!("unexpected detector output shape {:?}", &*mat.mat_size()))
 		})?;
-		if slots[index]
-			.replace(mat.data_typed::<f32>().map_err(inference_error)?.to_vec())
-			.is_some()
-		{
+		if slots[index].replace(mat).is_some() {
 			return Err(RecognizerError::Inference(format!(
 				"duplicate detector output for branch {index}"
 			)));
@@ -508,39 +577,24 @@ struct Detection {
 	landmarks: [(f32, f32); 5],
 }
 
-/// Resizes the frame to the detector's static input size and converts to NCHW
-/// f32 normalized as (x - 127.5) / 128, per the SCRFD reference. OpenCV's
-/// blob_from_image resizes with INTER_LINEAR (the InsightFace reference
-/// preprocessing).
-fn detector_input(img: &Mat) -> Result<Mat, RecognizerError> {
-	dnn::blob_from_image(
-		img,
-		1.0 / 128.0,
-		Size::new(DETECTOR_INPUT_SIZE as i32, DETECTOR_INPUT_SIZE as i32),
-		Scalar::all(127.5),
-		false,
-		false,
-		CV_32F,
-	)
-	.map_err(inference_error)
-}
-
 /// Decodes SCRFD anchor-free outputs. `branches` holds the 9 output tensors in
 /// model order: [score8, score16, score32, bbox8, bbox16, bbox32, kps8, kps16,
 /// kps32]. Each branch has SCRFD_NUM_ANCHORS entries per feature-map point,
 /// adjacent per point. `ratio` maps model-input pixels back to original frame
 /// pixels. Scores are pre-filtered with an AVX2 scan (scalar fallback), see
 /// `simd`.
-fn decode_detections(branches: &[Vec<f32>], ratio: f32, width: usize, height: usize) -> Vec<Detection> {
+fn decode_detections(branches: &[&[f32]], ratio: f32, width: usize, height: usize) -> Vec<Detection> {
 	let mut candidates: Vec<(Detection, f32)> = Vec::new();
+	let mut indices = Vec::new();
 
 	for (level, stride) in STRIDES.iter().enumerate() {
-		let scores = &branches[level];
-		let bboxes = &branches[3 + level];
-		let kps = &branches[6 + level];
+		let scores = branches[level];
+		let bboxes = branches[3 + level];
+		let kps = branches[6 + level];
 		let fmap = DETECTOR_INPUT_SIZE / stride;
 
-		for index in simd::above_threshold(scores, DETECTOR_CONF_THRESHOLD) {
+		simd::above_threshold(scores, DETECTOR_CONF_THRESHOLD, &mut indices);
+		for index in indices.iter().copied() {
 			let index = index as usize;
 			let score = scores[index];
 
@@ -589,31 +643,6 @@ fn new_clahe() -> Result<Ptr<imgproc::CLAHE>, RecognizerError> {
 		.map_err(|err| RecognizerError::Setup(err.to_string()))
 }
 
-/// Contrast-limited adaptive histogram equalization of the grayscale plane of
-/// an RGB24 buffer (gray is replicated across the 3 channels; the equalized
-/// gray is replicated back into all three). OpenCV's CLAHE does the SIMD-heavy
-/// work.
-fn equalize_frame(
-	clahe: &mut Ptr<imgproc::CLAHE>,
-	img_data: &[u8],
-	width: i32,
-	height: i32,
-) -> Result<Mat, RecognizerError> {
-	// SAFETY: `img_data` outlives `frame`, OpenCV never frees external data,
-	// and `frame` is only used as a const cvt_color source.
-	let frame =
-		unsafe { Mat::new_rows_cols_with_data_unsafe_def(height, width, CV_8UC3, img_data.as_ptr() as *mut c_void) }
-			.map_err(inference_error)?;
-
-	let mut gray = Mat::default();
-	imgproc::cvt_color_def(&frame, &mut gray, imgproc::COLOR_RGB2GRAY).map_err(inference_error)?;
-	let mut equalized = Mat::default();
-	clahe.apply(&gray, &mut equalized).map_err(inference_error)?;
-	let mut rgb = Mat::default();
-	imgproc::cvt_color_def(&equalized, &mut rgb, imgproc::COLOR_GRAY2RGB).map_err(inference_error)?;
-	Ok(rgb)
-}
-
 fn clamp_coord(value: f32, limit: usize) -> i64 {
 	value.round().clamp(0.0, limit as f32) as i64
 }
@@ -655,29 +684,6 @@ const ARCFACE_TEMPLATE: [(f32, f32); 5] = [
 	(70.7299, 92.2041),
 ];
 
-/// Warps the frame to an aligned ENCODER_INPUT_SIZE² face crop, returned as an
-/// NCHW f32 blob Mat, BGR order, normalized (x - 127.5) / 127.5.
-fn align_face(img: &Mat, landmarks: &[(f32, f32); 5]) -> Result<Mat, RecognizerError> {
-	let m = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
-	let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).map_err(inference_error)?;
-
-	let size = Size::new(ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32);
-	let mut crop = Mat::default();
-	imgproc::warp_affine(
-		img,
-		&mut crop,
-		&matrix,
-		size,
-		imgproc::INTER_LINEAR,
-		BORDER_REPLICATE,
-		Scalar::all(0.0),
-		AlgorithmHint::ALGO_HINT_DEFAULT,
-	)
-	.map_err(inference_error)?;
-
-	dnn::blob_from_image(&crop, 1.0 / 127.5, size, Scalar::all(127.5), true, false, CV_32F).map_err(inference_error)
-}
-
 /// Estimates the 2D similarity transform mapping `src` landmarks to `dst`
 /// (Umeyama, no reflection), returned as a 2x3 row-major matrix
 /// `[a, -b, tx, b, a, ty]`.
@@ -717,10 +723,9 @@ fn similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> [f32; 6
 	[a, -b, tx, b, a, ty]
 }
 
-fn validate_rgb_buffer(width: u32, height: u32, actual_len: usize) -> Result<(), RecognizerError> {
+fn validate_gray_buffer(width: u32, height: u32, actual_len: usize) -> Result<(), RecognizerError> {
 	let expected_len = (width as usize)
 		.checked_mul(height as usize)
-		.and_then(|pixels| pixels.checked_mul(3))
 		.ok_or(RecognizerError::InvalidImageBuffer {
 			width,
 			height,
@@ -743,21 +748,70 @@ fn validate_rgb_buffer(width: u32, height: u32, actual_len: usize) -> Result<(),
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use opencv::core::Vec3b;
+	use opencv::core::{Vec3b, CV_8UC3};
+
+	/// Test helper: CLAHE + GRAY2RGB on a grayscale buffer, without a full
+	/// Recognizer (no models needed).
+	fn equalize_gray(clahe: &mut Ptr<imgproc::CLAHE>, img_data: &[u8], width: i32, height: i32) -> Result<Mat, RecognizerError> {
+		let frame =
+			unsafe { Mat::new_rows_cols_with_data_unsafe_def(height, width, CV_8UC1, img_data.as_ptr() as *mut c_void) }
+				.map_err(inference_error)?;
+		let mut equalized = Mat::default();
+		clahe.apply(&frame, &mut equalized).map_err(inference_error)?;
+		let mut rgb = Mat::default();
+		imgproc::cvt_color_def(&equalized, &mut rgb, imgproc::COLOR_GRAY2RGB).map_err(inference_error)?;
+		Ok(rgb)
+	}
+
+	/// Test helper: blob_from_image for the detector, without a Recognizer.
+	fn make_detector_blob(rgb: &Mat) -> Result<Mat, RecognizerError> {
+		dnn::blob_from_image(
+			rgb,
+			1.0 / 128.0,
+			Size::new(DETECTOR_INPUT_SIZE as i32, DETECTOR_INPUT_SIZE as i32),
+			Scalar::all(127.5),
+			false,
+			false,
+			CV_32F,
+		)
+		.map_err(inference_error)
+	}
+
+	/// Test helper: warp + blob_from_image for the encoder, without a Recognizer.
+	fn make_aligned_blob(rgb: &Mat, landmarks: &[(f32, f32); 5]) -> Result<Mat, RecognizerError> {
+		let m = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
+		let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]])
+			.map_err(inference_error)?;
+		let size = Size::new(ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32);
+		let mut crop = Mat::default();
+		imgproc::warp_affine(
+			rgb,
+			&mut crop,
+			&matrix,
+			size,
+			imgproc::INTER_LINEAR,
+			BORDER_REPLICATE,
+			Scalar::all(0.0),
+			AlgorithmHint::ALGO_HINT_DEFAULT,
+		)
+		.map_err(inference_error)?;
+		dnn::blob_from_image(&crop, 1.0 / 127.5, size, Scalar::all(127.5), true, false, CV_32F)
+			.map_err(inference_error)
+	}
 
 	#[test]
-	fn rejects_wrong_rgb_buffer_length() {
-		let err = validate_rgb_buffer(2, 2, 11).expect_err("invalid buffer should fail");
+	fn rejects_wrong_gray_buffer_length() {
+		let err = validate_gray_buffer(2, 2, 3).expect_err("invalid buffer should fail");
 
 		assert_eq!(
 			err.to_string(),
-			"invalid RGB buffer for 2x2 image: expected 12 bytes, got 11"
+			"invalid RGB buffer for 2x2 image: expected 4 bytes, got 3"
 		);
 	}
 
 	#[test]
-	fn accepts_exact_rgb_buffer_length() {
-		assert!(validate_rgb_buffer(2, 2, 12).is_ok());
+	fn accepts_exact_gray_buffer_length() {
+		assert!(validate_gray_buffer(2, 2, 4).is_ok());
 	}
 
 	#[test]
@@ -773,9 +827,9 @@ mod tests {
 	#[test]
 	fn clahe_keeps_flat_image_flat() {
 		let mut clahe = new_clahe().expect("clahe");
-		let img = vec![128u8; 32 * 32 * 3];
+		let img = vec![128u8; 32 * 32];
 
-		let out = equalize_frame(&mut clahe, &img, 32, 32).expect("equalize");
+		let out = equalize_gray(&mut clahe, &img, 32, 32).expect("equalize");
 		let pixels = out.data_typed::<Vec3b>().expect("pixels");
 
 		assert!(pixels.iter().all(|pixel| *pixel == pixels[0]));
@@ -786,17 +840,14 @@ mod tests {
 		// Pseudo-random noise squeezed into [100, 140], like a low-contrast
 		// IR frame.
 		let size = 340;
-		let mut img = vec![0u8; size * size * 3];
-		for index in 0..size * size {
+		let mut img = vec![0u8; size * size];
+		for (index, pixel) in img.iter_mut().enumerate() {
 			let seed = (index as u64).wrapping_mul(2654435761) & 0xffff_ffff;
-			let value = 100 + (seed % 41) as u8;
-			for channel in 0..3 {
-				img[index * 3 + channel] = value;
-			}
+			*pixel = 100 + (seed % 41) as u8;
 		}
 		let mut clahe = new_clahe().expect("clahe");
 
-		let out = equalize_frame(&mut clahe, &img, size as i32, size as i32).expect("equalize");
+		let out = equalize_gray(&mut clahe, &img, size as i32, size as i32).expect("equalize");
 		let pixels = out.data_typed::<Vec3b>().expect("pixels");
 
 		let min = pixels.iter().map(|pixel| pixel[0]).min().unwrap();
@@ -815,7 +866,7 @@ mod tests {
 		])
 		.expect("mat");
 
-		let blob = detector_input(&img).expect("blob");
+		let blob = make_detector_blob(&img).expect("blob");
 		let tensor = blob.data_typed::<f32>().expect("blob data");
 
 		let size = DETECTOR_INPUT_SIZE;
@@ -851,8 +902,8 @@ mod tests {
 		let empty32_b = vec![0.0_f32; (DETECTOR_INPUT_SIZE / 32).pow(2) * SCRFD_NUM_ANCHORS * 4];
 		let empty32_k = vec![0.0_f32; (DETECTOR_INPUT_SIZE / 32).pow(2) * SCRFD_NUM_ANCHORS * 10];
 
-		let branches = vec![
-			scores, empty16_s, empty32_s, bboxes, empty16_b, empty32_b, kps, empty16_k, empty32_k,
+		let branches: Vec<&[f32]> = vec![
+			&scores, &empty16_s, &empty32_s, &bboxes, &empty16_b, &empty32_b, &kps, &empty16_k, &empty32_k,
 		];
 
 		let ratio = 0.5;
@@ -974,7 +1025,7 @@ mod tests {
 			(210.0, 250.0),
 		];
 
-		let blob = align_face(&img, &landmarks).expect("align");
+		let blob = make_aligned_blob(&img, &landmarks).expect("align");
 		let crop = blob.data_typed::<f32>().expect("blob data");
 
 		assert_eq!(crop.len(), 3 * ENCODER_INPUT_SIZE * ENCODER_INPUT_SIZE);

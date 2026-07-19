@@ -11,10 +11,12 @@ built — do not treat it as live code).
   hex floats, one descriptor per line (`*.face` files). Parsing/formatting lives
   here; keep it dependency-free. `cosine_similarity` has an AVX2+FMA fast path
   (`src/simd.rs`, runtime dispatch, scalar fallback).
-- `crates/redface-capture` — V4L2 camera capture (GREY preferred, YUYV fallback),
-  frames delivered as RGB24 with gray replicated across channels.
+- `crates/redface-capture` — V4L2 camera capture (GREY preferred, YUYV/RGB3
+  fallback), frames delivered as grayscale (1 byte per pixel). GREY is
+  passed through; YUYV extracts luma; RGB3 converts via BT.601.
 - `crates/redface-recognition` — the inference stack: CLAHE preprocessing,
-  SCRFD detection, ArcFace alignment/encoding. Two inference backends,
+  SCRFD detection, ArcFace alignment/encoding. Accepts grayscale frames,
+  replicates to 3 channels internally for the models. Two inference backends,
   selected by cargo feature: OpenCV's DNN CPU backend (default) or OpenVINO
   (opt-in `openvino` feature); pixel processing (CLAHE, resize, warp) goes
   through OpenCV.

@@ -1,19 +1,8 @@
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-
-#[cfg(target_arch = "x86")]
-use std::arch::x86::{
-	__m128i, __m256i, __m512i, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
-	_mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm512_extracti32x4_epi32,
-	_mm512_loadu_si512,
-};
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{
-	__m128i, __m256i, __m512i, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
-	_mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm512_extracti32x4_epi32,
-	_mm512_loadu_si512,
-};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 use v4l::Device;
 use v4l::buffer::Type;
@@ -25,6 +14,14 @@ use v4l::video::Capture;
 
 const BUFFER_COUNT: u32 = 4;
 
+const GREY_FOURCC: FourCC = FourCC { repr: *b"GREY" };
+const RGB3_FOURCC: FourCC = FourCC { repr: *b"RGB3" };
+const YUYV_FOURCC: FourCC = FourCC { repr: *b"YUYV" };
+
+const PREFERRED_FORMATS: [FourCC; 3] = [GREY_FOURCC, RGB3_FOURCC, YUYV_FOURCC];
+
+/// A single camera frame, one byte per pixel (grayscale). NIR cameras
+/// deliver GREY natively; RGB and YUYV fallbacks are converted to luma.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
 	pub buffer: Vec<u8>,
@@ -42,6 +39,19 @@ pub enum StreamAction {
 pub struct CaptureStats {
 	pub dropped_frames: u32,
 	pub delivered_frames: u32,
+}
+
+/// Shared hand-off slot between the capture thread (producer) and the caller
+/// thread running `on_frame` (consumer). The producer always overwrites
+/// `frame` with the newest buffer, so any frame that arrives while the
+/// consumer is still processing the previous one is dropped. `stop` tells the
+/// producer to exit; `error` carries a fatal capture failure to the consumer.
+#[derive(Default)]
+struct FrameSlot {
+	frame: Option<Frame>,
+	stats: CaptureStats,
+	error: Option<CaptureError>,
+	stop: bool,
 }
 
 #[derive(Debug)]
@@ -131,36 +141,86 @@ impl Camera {
 			return Err(CaptureError::UnsupportedSelectedFormat(active.fourcc));
 		}
 
-		let mut stream =
+		let stream =
 			MmapStream::with_buffers(&device, Type::VideoCapture, BUFFER_COUNT).map_err(CaptureError::CreateStream)?;
 
-		let mut stats = CaptureStats::default();
-		loop {
-			let (raw, _) = stream.next().map_err(CaptureError::ReadFrame)?;
+		let slot = Arc::new((Mutex::new(FrameSlot::default()), Condvar::new()));
+		let producer_slot = Arc::clone(&slot);
+		let fourcc = active.fourcc;
+		let (width, height) = (active.width, active.height);
 
-			if active.fourcc == grey_fourcc() && is_black_frame(raw) {
-				stats.dropped_frames += 1;
-				continue;
+		let producer = thread::spawn(move || {
+			let (lock, ready) = &*producer_slot;
+			let mut stream = stream;
+			loop {
+				let (raw, _) = match stream.next() {
+					Ok(frame) => frame,
+					Err(source) => {
+						let mut slot = lock.lock().unwrap();
+						slot.error = Some(CaptureError::ReadFrame(source));
+						ready.notify_one();
+						return;
+					}
+				};
+
+				{
+					let mut slot = lock.lock().unwrap();
+					if slot.frame.is_some() {
+						slot.stats.dropped_frames += 1;
+						continue;
+					}
+				}
+
+				if fourcc == GREY_FOURCC && is_black_frame(raw) {
+					lock.lock().unwrap().stats.dropped_frames += 1;
+					continue;
+				}
+
+				let frame = Frame {
+					buffer: convert_to_gray(fourcc, raw),
+					width,
+					height,
+				};
+
+				let mut slot = lock.lock().unwrap();
+				if slot.stop {
+					return;
+				}
+				slot.frame = Some(frame);
+				ready.notify_one();
 			}
+		});
 
-			let buffer = convert_to_rgb(active.fourcc, raw);
-			stats.delivered_frames += 1;
+		let (lock, ready) = &*slot;
+		let outcome: Result<(), CaptureError> = loop {
+			let frame = {
+				let mut slot = lock.lock().unwrap();
+				while slot.frame.is_none() && slot.error.is_none() {
+					slot = ready.wait(slot).unwrap();
+				}
+				if let Some(error) = slot.error.take() {
+					slot.stop = true;
+					break Err(error);
+				}
+				slot.stats.delivered_frames += 1;
+				slot.frame.take().expect("frame present when error is none")
+			};
 
-			let action = on_frame(Frame {
-				buffer,
-				width: active.width,
-				height: active.height,
-			});
-			if matches!(action, StreamAction::Stop) {
-				return Ok(stats);
+			if matches!(on_frame(frame), StreamAction::Stop) {
+				lock.lock().unwrap().stop = true;
+				break Ok(());
 			}
-		}
+		};
+
+		let _ = producer.join();
+		let stats = lock.lock().unwrap().stats;
+		outcome.map(|()| stats)
 	}
 }
 
 fn select_preferred_format(formats: impl IntoIterator<Item = FourCC>) -> Option<FourCC> {
 	let available = formats.into_iter().collect::<Vec<_>>();
-	preferred_formats()
+	PREFERRED_FORMATS
 		.into_iter()
 		.find(|preferred| available.iter().any(|candidate| candidate == preferred))
 }
@@ -190,205 +250,33 @@ fn select_largest_dimensions(frame_sizes: &[FrameSize]) -> Option<(u32, u32)> {
 }
 
 fn is_supported_color_format(fourcc: FourCC) -> bool {
-	fourcc == grey_fourcc() || fourcc == rgb3_fourcc() || fourcc == yuyv_fourcc()
+	fourcc == GREY_FOURCC || fourcc == RGB3_FOURCC || fourcc == YUYV_FOURCC
 }
 
-fn convert_to_rgb(fourcc: FourCC, raw: &[u8]) -> Vec<u8> {
-	if fourcc == grey_fourcc() {
-		gray_to_rgb(raw)
-	} else if fourcc == rgb3_fourcc() {
+fn convert_to_gray(fourcc: FourCC, raw: &[u8]) -> Vec<u8> {
+	if fourcc == GREY_FOURCC {
 		raw.to_vec()
-	} else if fourcc == yuyv_fourcc() {
-		yuyv_to_rgb(raw)
+	} else if fourcc == RGB3_FOURCC {
+		rgb_to_gray(raw)
+	} else if fourcc == YUYV_FOURCC {
+		yuyv_to_gray(raw)
 	} else {
 		raw.to_vec()
 	}
 }
 
-fn preferred_formats() -> [FourCC; 3] {
-	[grey_fourcc(), rgb3_fourcc(), yuyv_fourcc()]
+/// RGB3 → grayscale via BT.601 luma coefficients, integer approximation:
+/// (77R + 150G + 29B) >> 8. Rare fallback path (NIR cameras prefer GREY).
+fn rgb_to_gray(rgb: &[u8]) -> Vec<u8> {
+	rgb.chunks_exact(3)
+		.map(|pixel| ((77 * u16::from(pixel[0]) + 150 * u16::from(pixel[1]) + 29 * u16::from(pixel[2])) >> 8) as u8)
+		.collect()
 }
 
-fn grey_fourcc() -> FourCC {
-	FourCC::new(b"GREY")
-}
-
-fn rgb3_fourcc() -> FourCC {
-	FourCC::new(b"RGB3")
-}
-
-fn yuyv_fourcc() -> FourCC {
-	FourCC::new(b"YUYV")
-}
-
-fn gray_to_rgb(gray: &[u8]) -> Vec<u8> {
-	let mut rgb = vec![0_u8; gray.len() * 3];
-
-	#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-	{
-		if std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw") {
-			// Safe because the runtime feature checks guarantee the required AVX-512 and SSSE3 support.
-			unsafe { gray_to_rgb_avx512(gray, &mut rgb) };
-			return rgb;
-		}
-		if std::arch::is_x86_feature_detected!("avx2") {
-			// Safe because the runtime feature checks guarantee the required AVX2 and SSSE3 support.
-			unsafe { gray_to_rgb_avx2(gray, &mut rgb) };
-			return rgb;
-		}
-		if std::arch::is_x86_feature_detected!("ssse3") {
-			// Safe because the runtime feature check guarantees SSSE3 support.
-			unsafe { gray_to_rgb_ssse3(gray, &mut rgb) };
-			return rgb;
-		}
-	}
-
-	gray_to_rgb_scalar(gray, &mut rgb);
-	rgb
-}
-
-fn gray_to_rgb_scalar(gray: &[u8], rgb: &mut [u8]) {
-	for (index, pixel) in gray.iter().copied().enumerate() {
-		let offset = index * 3;
-		rgb[offset] = pixel;
-		rgb[offset + 1] = pixel;
-		rgb[offset + 2] = pixel;
-	}
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f,avx512bw,avx2,ssse3")]
-unsafe fn gray_to_rgb_avx512(gray: &[u8], rgb: &mut [u8]) {
-	let masks = unsafe { shuffle_masks() };
-
-	let mut input_offset = 0;
-	let mut output_offset = 0;
-	while input_offset + 64 <= gray.len() {
-		// Safe because the loop bounds guarantee 64 readable input bytes.
-		let pixels = unsafe { _mm512_loadu_si512(gray.as_ptr().add(input_offset).cast::<__m512i>()) };
-
-		unsafe { store_rgb_block_16(_mm512_extracti32x4_epi32::<0>(pixels), &masks, rgb, output_offset) };
-		unsafe { store_rgb_block_16(_mm512_extracti32x4_epi32::<1>(pixels), &masks, rgb, output_offset + 48) };
-		unsafe { store_rgb_block_16(_mm512_extracti32x4_epi32::<2>(pixels), &masks, rgb, output_offset + 96) };
-		unsafe { store_rgb_block_16(_mm512_extracti32x4_epi32::<3>(pixels), &masks, rgb, output_offset + 144) };
-
-		input_offset += 64;
-		output_offset += 192;
-	}
-
-	if input_offset < gray.len() {
-		unsafe { gray_to_rgb_avx2(&gray[input_offset..], &mut rgb[output_offset..]) };
-	}
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,ssse3")]
-unsafe fn gray_to_rgb_avx2(gray: &[u8], rgb: &mut [u8]) {
-	let masks = unsafe { shuffle_masks() };
-
-	let mut input_offset = 0;
-	let mut output_offset = 0;
-	while input_offset + 32 <= gray.len() {
-		// Safe because the loop bounds guarantee 32 readable input bytes.
-		let pixels = unsafe { _mm256_loadu_si256(gray.as_ptr().add(input_offset).cast::<__m256i>()) };
-		unsafe { store_rgb_block_16(_mm256_castsi256_si128(pixels), &masks, rgb, output_offset) };
-		unsafe { store_rgb_block_16(_mm256_extracti128_si256::<1>(pixels), &masks, rgb, output_offset + 48) };
-
-		input_offset += 32;
-		output_offset += 96;
-	}
-
-	if input_offset < gray.len() {
-		unsafe { gray_to_rgb_ssse3(&gray[input_offset..], &mut rgb[output_offset..]) };
-	}
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "ssse3")]
-unsafe fn gray_to_rgb_ssse3(gray: &[u8], rgb: &mut [u8]) {
-	let masks = unsafe { shuffle_masks() };
-
-	let mut input_offset = 0;
-	let mut output_offset = 0;
-	while input_offset + 16 <= gray.len() {
-		// Safe because the loop bounds guarantee 16 readable input bytes.
-		let pixels = unsafe { _mm_loadu_si128(gray.as_ptr().add(input_offset).cast::<__m128i>()) };
-		unsafe { store_rgb_block_16(pixels, &masks, rgb, output_offset) };
-
-		input_offset += 16;
-		output_offset += 48;
-	}
-
-	gray_to_rgb_tail(gray, input_offset, rgb, output_offset);
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn gray_to_rgb_tail(gray: &[u8], input_offset: usize, rgb: &mut [u8], output_offset: usize) {
-	for (index, pixel) in gray[input_offset..].iter().copied().enumerate() {
-		let offset = output_offset + index * 3;
-		rgb[offset] = pixel;
-		rgb[offset + 1] = pixel;
-		rgb[offset + 2] = pixel;
-	}
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "ssse3")]
-unsafe fn shuffle_masks() -> (__m128i, __m128i, __m128i) {
-	(
-		_mm_setr_epi8(0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5),
-		_mm_setr_epi8(5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10),
-		_mm_setr_epi8(10, 11, 11, 11, 12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 15, 15),
-	)
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "ssse3")]
-unsafe fn store_rgb_block_16(
-	pixels: __m128i,
-	masks: &(__m128i, __m128i, __m128i),
-	rgb: &mut [u8],
-	output_offset: usize,
-) {
-	// Safe because output_offset always points at a full 48-byte block reserved in the RGB buffer.
-	let out_ptr = unsafe { rgb.as_mut_ptr().add(output_offset).cast::<__m128i>() };
-	let (mask0, mask1, mask2) = *masks;
-
-	// Safe because the destination buffer is pre-sized and each store writes exactly one 16-byte lane.
-	unsafe {
-		_mm_storeu_si128(out_ptr, _mm_shuffle_epi8(pixels, mask0));
-		_mm_storeu_si128(out_ptr.add(1), _mm_shuffle_epi8(pixels, mask1));
-		_mm_storeu_si128(out_ptr.add(2), _mm_shuffle_epi8(pixels, mask2));
-	}
-}
-
-fn yuyv_to_rgb(yuyv: &[u8]) -> Vec<u8> {
-	if yuyv.is_empty() {
-		return Vec::new();
-	}
-
-	let mut rgb = Vec::with_capacity(yuyv.len() * 6 / 4);
-	for chunk in yuyv.chunks_exact(4) {
-		let y1 = chunk[0];
-		let u = chunk[1];
-		let y2 = chunk[2];
-		let v = chunk[3];
-
-		rgb.push(y1.wrapping_add(v.wrapping_sub(128).wrapping_mul(2) / 3));
-		rgb.push(
-			y1.wrapping_sub(u.wrapping_sub(128) / 3)
-				.wrapping_sub(v.wrapping_sub(128) / 3),
-		);
-		rgb.push(y1.wrapping_add(u.wrapping_sub(128).wrapping_mul(2) / 3));
-
-		rgb.push(y2.wrapping_add(v.wrapping_sub(128).wrapping_mul(2) / 3));
-		rgb.push(
-			y2.wrapping_sub(u.wrapping_sub(128) / 3)
-				.wrapping_sub(v.wrapping_sub(128) / 3),
-		);
-		rgb.push(y2.wrapping_add(u.wrapping_sub(128).wrapping_mul(2) / 3));
-	}
-	rgb
+/// YUYV → grayscale: extract the Y (luma) bytes. YUYV packs two pixels per
+/// 4-byte chunk [Y0, Cb, Y1, Cr], so the Y values sit at even indices.
+fn yuyv_to_gray(yuyv: &[u8]) -> Vec<u8> {
+	yuyv.iter().step_by(2).copied().collect()
 }
 
 /// A GREY frame counts as black — IR illuminator off, lens covered, or
@@ -398,7 +286,7 @@ fn yuyv_to_rgb(yuyv: &[u8]) -> Vec<u8> {
 /// check, a bright frame with few dark pixels is fine: close-up face frames
 /// are exactly that.
 const BLACK_PIXEL: u8 = 32;
-const BLACK_FRAME_DARK_RATIO: usize = 2;
+const BLACK_FRAME_DARK_RATIO: f32 = 0.9;
 
 fn is_black_frame(img: &[u8]) -> bool {
 	if img.is_empty() {
@@ -406,7 +294,8 @@ fn is_black_frame(img: &[u8]) -> bool {
 	}
 
 	let dark = img.iter().filter(|pixel| **pixel < BLACK_PIXEL).count();
-	dark * BLACK_FRAME_DARK_RATIO > img.len()
+	// println!("Black frame check: {} dark pixels out of {} total", dark, img.len());
+	dark as f32 > BLACK_FRAME_DARK_RATIO * img.len() as f32
 }
 
 #[cfg(test)]
@@ -417,7 +306,7 @@ mod tests {
 	fn frame_size(width: u32, height: u32) -> FrameSize {
 		FrameSize {
 			index: 0,
-			fourcc: grey_fourcc(),
+			fourcc: GREY_FOURCC,
 			typ: 0,
 			size: FrameSizeEnum::Discrete(Discrete { width, height }),
 		}
@@ -425,9 +314,9 @@ mod tests {
 
 	#[test]
 	fn prefers_grey_over_other_supported_formats() {
-		let selected = select_preferred_format([yuyv_fourcc(), grey_fourcc(), rgb3_fourcc()]).expect("format selected");
+		let selected = select_preferred_format([YUYV_FOURCC, GREY_FOURCC, RGB3_FOURCC]).expect("format selected");
 
-		assert_eq!(selected, grey_fourcc());
+		assert_eq!(selected, GREY_FOURCC);
 	}
 
 	#[test]
@@ -438,55 +327,25 @@ mod tests {
 	}
 
 	#[test]
-	fn expands_greyscale_pixels_to_rgb_triplets() {
-		assert_eq!(gray_to_rgb(&[10, 20]), vec![10, 10, 10, 20, 20, 20]);
+	fn grey_passes_through_unchanged() {
+		assert_eq!(convert_to_gray(GREY_FOURCC, &[10, 20, 30]), vec![10, 20, 30]);
 	}
 
 	#[test]
-	fn expands_long_greyscale_input_exactly() {
-		let gray = (0_u8..32).collect::<Vec<_>>();
-		let rgb = gray_to_rgb(&gray);
-
-		assert_eq!(rgb.len(), gray.len() * 3);
-		for (index, pixel) in gray.into_iter().enumerate() {
-			let offset = index * 3;
-			assert_eq!(&rgb[offset..offset + 3], &[pixel, pixel, pixel]);
-		}
+	fn rgb_to_gray_uses_luma_coefficients() {
+		// Pure red, green, blue.
+		assert_eq!(rgb_to_gray(&[255, 0, 0]), vec![76]); // 77*255>>8 = 76
+		assert_eq!(rgb_to_gray(&[0, 255, 0]), vec![149]); // 150*255>>8 = 149
+		assert_eq!(rgb_to_gray(&[0, 0, 255]), vec![28]); // 29*255>>8 = 28
+		// White: (77+150+29)*255>>8 = 255.
+		assert_eq!(rgb_to_gray(&[255, 255, 255]), vec![255]);
 	}
 
-	#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 	#[test]
-	fn avx2_matches_scalar_when_available() {
-		if !(std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("ssse3")) {
-			return;
-		}
-
-		let gray = (0_u8..65).collect::<Vec<_>>();
-		let mut expected = vec![0_u8; gray.len() * 3];
-		gray_to_rgb_scalar(&gray, &mut expected);
-		let mut actual = vec![0_u8; gray.len() * 3];
-		unsafe { gray_to_rgb_avx2(&gray, &mut actual) };
-
-		assert_eq!(actual, expected);
-	}
-
-	#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-	#[test]
-	fn avx512_matches_scalar_when_available() {
-		if !(std::arch::is_x86_feature_detected!("avx512f")
-			&& std::arch::is_x86_feature_detected!("avx512bw")
-			&& std::arch::is_x86_feature_detected!("ssse3"))
-		{
-			return;
-		}
-
-		let gray = (0_u8..97).collect::<Vec<_>>();
-		let mut expected = vec![0_u8; gray.len() * 3];
-		gray_to_rgb_scalar(&gray, &mut expected);
-		let mut actual = vec![0_u8; gray.len() * 3];
-		unsafe { gray_to_rgb_avx512(&gray, &mut actual) };
-
-		assert_eq!(actual, expected);
+	fn yuyv_extracts_luma_bytes() {
+		// [Y0=100, Cb, Y1=120, Cr] → [100, 120]
+		assert_eq!(yuyv_to_gray(&[100, 128, 120, 128]), vec![100, 120]);
+		assert_eq!(yuyv_to_gray(&[]), Vec::<u8>::new());
 	}
 
 	#[test]
@@ -515,12 +374,5 @@ mod tests {
 		assert!(!is_black_frame(&frame));
 		// Fully saturated is not a *black* frame.
 		assert!(!is_black_frame(&[255; 100]));
-	}
-
-	#[test]
-	fn converts_yuyv_using_wrapping_math() {
-		let rgb = yuyv_to_rgb(&[100, 128, 120, 128]);
-
-		assert_eq!(rgb, vec![100, 100, 100, 120, 120, 120]);
 	}
 }

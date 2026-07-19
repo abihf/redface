@@ -20,7 +20,7 @@ fn main() {
 	let frame_kind = std::env::var("FRAME").unwrap_or_else(|_| "blank".to_owned());
 	let frame = match frame_kind.as_str() {
 		// 340x340 mid-gray frame — no face, but exercises the full pipeline.
-		"blank" => vec![128u8; 340 * 340 * 3],
+		"blank" => vec![128u8; 340 * 340],
 		"noise" => noise_frame(),
 		other => panic!("invalid FRAME '{other}': expected blank or noise"),
 	};
@@ -36,20 +36,16 @@ fn main() {
 	}
 }
 
-/// Deterministic 340x340 gray noise frame from a tiny seeded xorshift PRNG
-/// (gray is replicated across the 3 channels).
+/// Deterministic 340x340 gray noise frame from a tiny seeded xorshift PRNG.
 fn noise_frame() -> Vec<u8> {
 	let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-	let mut frame = vec![0u8; 340 * 340 * 3];
-	for pixel in frame.chunks_mut(3) {
+	let mut frame = vec![0u8; 340 * 340];
+	for pixel in frame.iter_mut() {
 		// xorshift64
 		state ^= state << 13;
 		state ^= state >> 7;
 		state ^= state << 17;
-		let value = (state >> 56) as u8;
-		pixel[0] = value;
-		pixel[1] = value;
-		pixel[2] = value;
+		*pixel = (state >> 56) as u8;
 	}
 	frame
 }

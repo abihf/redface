@@ -21,7 +21,7 @@ fn main() {
 	eprintln!("loading recognizer (device {device})...");
 	let mut recognizer = Recognizer::new(&model_dir, device).expect("recognizer loads");
 
-	let frame = vec![128u8; 340 * 340 * 3];
+	let frame = vec![128u8; 340 * 340];
 	for _ in 0..3 {
 		let _ = recognizer.recognize(&frame, 340, 340, 0).expect("inference works");
 	}

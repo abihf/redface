@@ -23,31 +23,30 @@ fn has_avx2() -> bool {
 	})
 }
 
-/// Indices of all scores at or above `threshold`, in ascending order.
-pub fn above_threshold(scores: &[f32], threshold: f32) -> Vec<u32> {
+/// Appends indices of all scores at or above `threshold` (ascending) to `out`.
+pub fn above_threshold(scores: &[f32], threshold: f32, out: &mut Vec<u32>) {
+	out.clear();
 	#[cfg(target_arch = "x86_64")]
 	if has_avx2() {
 		// SAFETY: AVX2 support was detected at runtime.
-		return unsafe { above_threshold_avx2(scores, threshold) };
+		unsafe { above_threshold_avx2(scores, threshold, out) };
+		return;
 	}
-	above_threshold_scalar(scores, threshold)
+	above_threshold_scalar(scores, threshold, out);
 }
 
-fn above_threshold_scalar(scores: &[f32], threshold: f32) -> Vec<u32> {
-	let mut indices = Vec::new();
+fn above_threshold_scalar(scores: &[f32], threshold: f32, out: &mut Vec<u32>) {
 	for (index, &score) in scores.iter().enumerate() {
 		if score >= threshold {
-			indices.push(index as u32);
+			out.push(index as u32);
 		}
 	}
-	indices
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn above_threshold_avx2(scores: &[f32], threshold: f32) -> Vec<u32> {
+unsafe fn above_threshold_avx2(scores: &[f32], threshold: f32, out: &mut Vec<u32>) {
 	unsafe {
-		let mut indices = Vec::new();
 		let broadcast = _mm256_set1_ps(threshold);
 		let mut chunks = scores.chunks_exact(8);
 		let mut base = 0_u32;
@@ -55,23 +54,28 @@ unsafe fn above_threshold_avx2(scores: &[f32], threshold: f32) -> Vec<u32> {
 			let values = _mm256_loadu_ps(chunk.as_ptr());
 			let mut bits = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GE_OQ>(values, broadcast)) as u32;
 			while bits != 0 {
-				indices.push(base + bits.trailing_zeros());
+				out.push(base + bits.trailing_zeros());
 				bits &= bits - 1;
 			}
 			base += 8;
 		}
 		for (offset, &score) in chunks.remainder().iter().enumerate() {
 			if score >= threshold {
-				indices.push(base + offset as u32);
+				out.push(base + offset as u32);
 			}
 		}
-		indices
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn collect(scores: &[f32], threshold: f32) -> Vec<u32> {
+		let mut out = Vec::new();
+		above_threshold(scores, threshold, &mut out);
+		out
+	}
 
 	#[test]
 	fn above_threshold_matches_scalar() {
@@ -86,20 +90,25 @@ mod tests {
 		scores[14_801] = 0.5;
 
 		for threshold in [0.5, 0.0, 1.0, 0.123] {
-			assert_eq!(
-				above_threshold(&scores, threshold),
-				above_threshold_scalar(&scores, threshold),
-				"threshold {threshold}"
-			);
+			let mut expected = Vec::new();
+			above_threshold_scalar(&scores, threshold, &mut expected);
+			assert_eq!(collect(&scores, threshold), expected, "threshold {threshold}");
 		}
 	}
 
 	#[test]
 	fn above_threshold_handles_edge_lengths() {
-		assert_eq!(above_threshold(&[], 0.5), Vec::<u32>::new());
-		assert_eq!(above_threshold(&[0.5], 0.5), vec![0]);
-		assert_eq!(above_threshold(&[0.4; 7], 0.5), Vec::<u32>::new());
+		assert_eq!(collect(&[], 0.5), Vec::<u32>::new());
+		assert_eq!(collect(&[0.5], 0.5), vec![0]);
+		assert_eq!(collect(&[0.4; 7], 0.5), Vec::<u32>::new());
 		let all: Vec<u32> = (0..8).collect();
-		assert_eq!(above_threshold(&[0.9; 8], 0.5), all);
+		assert_eq!(collect(&[0.9; 8], 0.5), all);
+	}
+
+	#[test]
+	fn above_threshold_reuses_buffer() {
+		let mut out = vec![99; 4];
+		above_threshold(&[0.1, 0.9, 0.2], 0.5, &mut out);
+		assert_eq!(out, vec![1]);
 	}
 }
