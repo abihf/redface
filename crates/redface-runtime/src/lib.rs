@@ -244,7 +244,10 @@ pub fn verify(recognizer: &mut Recognizer, options: &VerifyOptions) -> Result<bo
 			}
 
 			let rec_start = Instant::now();
-			let faces = match recognizer.recognize(&frame.buffer, frame.width, frame.height, 0) {
+			// 1:1 authentication against a known user: encode only the
+			// best-scoring detection — the detector routinely reports the
+			// same face several times at different scales.
+			let faces = match recognizer.recognize(&frame.buffer, frame.width, frame.height, 1) {
 				Ok(faces) => faces,
 				Err(err) => {
 					fatal_error = Some(VerifyError::Recognition(err));

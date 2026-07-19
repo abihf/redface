@@ -354,9 +354,9 @@ mod tests {
 		assert!(is_black_frame(&[]));
 		// Fully black frame.
 		assert!(is_black_frame(&[10; 100]));
-		// More than half of the pixels below the threshold.
+		// Over 90% of the pixels below the threshold.
 		let mut frame = vec![200_u8; 100];
-		for pixel in frame.iter_mut().take(60) {
+		for pixel in frame.iter_mut().take(95) {
 			*pixel = 10;
 		}
 		assert!(is_black_frame(&frame));

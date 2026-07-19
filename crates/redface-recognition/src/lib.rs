@@ -275,6 +275,10 @@ impl Recognizer {
 		}
 	}
 
+	/// Detects faces in a grayscale frame and returns them with their
+	/// descriptors, best detector score first. `max_faces` caps how many of
+	/// the top detections get encoded (0 = no limit): SCRFD often reports the
+	/// same face several times at different scales, so 1:1 callers pass 1.
 	pub fn recognize(
 		&mut self,
 		img_data: &[u8],
@@ -282,21 +286,19 @@ impl Recognizer {
 		height: u32,
 		max_faces: usize,
 	) -> Result<Vec<Face>, RecognizerError> {
-		validate_gray_buffer(width, height, img_data.len())?;
-
 		// CLAHE contrast normalization: raw IR frames are often low-contrast,
 		// which RGB-trained CNN detectors handle poorly. Applied before both
 		// detection and encoding (the recipe Howdy and Visage use on these
 		// cameras).
 		self.equalize_frame(img_data, width as i32, height as i32)?;
 
-		let detections = self.detect(width as usize, height as usize)?;
+		let mut detections = self.detect(width as usize, height as usize)?;
 
 		if detections.is_empty() {
 			return Ok(Vec::new());
 		}
-		if max_faces > 0 && detections.len() > max_faces {
-			return Ok(Vec::new());
+		if max_faces > 0 {
+			detections.truncate(max_faces);
 		}
 
 		let mut faces = Vec::with_capacity(detections.len());
@@ -582,7 +584,7 @@ struct Detection {
 /// kps32]. Each branch has SCRFD_NUM_ANCHORS entries per feature-map point,
 /// adjacent per point. `ratio` maps model-input pixels back to original frame
 /// pixels. Scores are pre-filtered with an AVX2 scan (scalar fallback), see
-/// `simd`.
+/// `simd`. Returned detections are sorted by descending score.
 fn decode_detections(branches: &[&[f32]], ratio: f32, width: usize, height: usize) -> Vec<Detection> {
 	let mut candidates: Vec<(Detection, f32)> = Vec::new();
 	let mut indices = Vec::new();
@@ -647,6 +649,9 @@ fn clamp_coord(value: f32, limit: usize) -> i64 {
 	value.round().clamp(0.0, limit as f32) as i64
 }
 
+/// Greedy NMS: sorts candidates by descending score, then keeps each box
+/// unless its IoU with an already-kept box exceeds `threshold`. The result
+/// stays sorted by descending score.
 fn nms(mut candidates: Vec<(Detection, f32)>, threshold: f32) -> Vec<Detection> {
 	candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 	let mut kept: Vec<(Detection, f32)> = Vec::with_capacity(candidates.len());
@@ -723,28 +728,6 @@ fn similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> [f32; 6
 	[a, -b, tx, b, a, ty]
 }
 
-fn validate_gray_buffer(width: u32, height: u32, actual_len: usize) -> Result<(), RecognizerError> {
-	let expected_len = (width as usize)
-		.checked_mul(height as usize)
-		.ok_or(RecognizerError::InvalidImageBuffer {
-			width,
-			height,
-			expected_len: usize::MAX,
-			actual_len,
-		})?;
-
-	if actual_len != expected_len {
-		return Err(RecognizerError::InvalidImageBuffer {
-			width,
-			height,
-			expected_len,
-			actual_len,
-		});
-	}
-
-	Ok(())
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -797,21 +780,6 @@ mod tests {
 		.map_err(inference_error)?;
 		dnn::blob_from_image(&crop, 1.0 / 127.5, size, Scalar::all(127.5), true, false, CV_32F)
 			.map_err(inference_error)
-	}
-
-	#[test]
-	fn rejects_wrong_gray_buffer_length() {
-		let err = validate_gray_buffer(2, 2, 3).expect_err("invalid buffer should fail");
-
-		assert_eq!(
-			err.to_string(),
-			"invalid RGB buffer for 2x2 image: expected 4 bytes, got 3"
-		);
-	}
-
-	#[test]
-	fn accepts_exact_gray_buffer_length() {
-		assert!(validate_gray_buffer(2, 2, 4).is_ok());
 	}
 
 	#[test]
@@ -961,6 +929,38 @@ mod tests {
 		assert_eq!(kept.len(), 2);
 		assert_eq!(kept[0].rectangle.left, 0);
 		assert_eq!(kept[1].rectangle.left, 500);
+	}
+
+	#[test]
+	fn decode_returns_detections_sorted_by_descending_score() {
+		// Two stride-8 anchors far apart (disjoint boxes), the lower-scoring
+		// one first in the tensor.
+		let fmap = DETECTOR_INPUT_SIZE / 8;
+		let entries = fmap * fmap * SCRFD_NUM_ANCHORS;
+		let mut scores = vec![0.0_f32; entries];
+		let bboxes = vec![0.0_f32; entries * 4];
+		let kps = vec![0.0_f32; entries * 10];
+
+		scores[0] = 0.6; // feature point (0, 0) -> box at left = 0
+		scores[(7 * fmap + 5) * SCRFD_NUM_ANCHORS] = 0.9; // point (5, 7) -> left = 5*8*0.5 = 20
+
+		let empty16_s = vec![0.0_f32; (DETECTOR_INPUT_SIZE / 16).pow(2) * SCRFD_NUM_ANCHORS];
+		let empty16_b = vec![0.0_f32; (DETECTOR_INPUT_SIZE / 16).pow(2) * SCRFD_NUM_ANCHORS * 4];
+		let empty16_k = vec![0.0_f32; (DETECTOR_INPUT_SIZE / 16).pow(2) * SCRFD_NUM_ANCHORS * 10];
+		let empty32_s = vec![0.0_f32; (DETECTOR_INPUT_SIZE / 32).pow(2) * SCRFD_NUM_ANCHORS];
+		let empty32_b = vec![0.0_f32; (DETECTOR_INPUT_SIZE / 32).pow(2) * SCRFD_NUM_ANCHORS * 4];
+		let empty32_k = vec![0.0_f32; (DETECTOR_INPUT_SIZE / 32).pow(2) * SCRFD_NUM_ANCHORS * 10];
+
+		let branches: Vec<&[f32]> = vec![
+			&scores, &empty16_s, &empty32_s, &bboxes, &empty16_b, &empty32_b, &kps, &empty16_k, &empty32_k,
+		];
+
+		let detections = decode_detections(&branches, 0.5, 320, 320);
+
+		assert_eq!(detections.len(), 2);
+		// Zero bbox distances: degenerate box at the anchor center.
+		assert_eq!(detections[0].rectangle.left, 20, "highest score first");
+		assert_eq!(detections[1].rectangle.left, 0);
 	}
 
 	/// 2x3 row-major affine application, for transform assertions.
