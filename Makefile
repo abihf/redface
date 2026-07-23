@@ -7,7 +7,7 @@ PAMDIR = $(LIBDIR)/security
 
 TARGET_DIR = ./target/release
 
-ENABLE_OPENVINO ?= 0
+ENABLE_OPENVINO ?= $(shell pkg-config --exists openvino && echo 1 || echo 0)
 
 # --no-default-features keeps the default ncnn backend out of OpenVINO builds.
 OPENVINO_ARGS = 

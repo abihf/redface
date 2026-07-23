@@ -10,6 +10,8 @@ use std::time::Instant;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
+use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
@@ -21,17 +23,16 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
 	Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
 };
-use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
-use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
-use tiny_skia::{Pixmap, PixmapMut};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface};
+use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, QueueHandle};
 
 use crate::auth::{AuthEvent, FaceAuth};
-use crate::config::LockConfig;
-use crate::ui::{self, Fonts, UiState};
+use crate::config::{Color, LockConfig};
+use crate::gpu::{Gpu, GpuError, GpuSurface};
+use crate::scene::{Scene, Uniforms};
+use crate::ui::{self, Fonts, GlyphAtlas, UiState};
 
 const BTN_LEFT: u32 = 0x110;
 
@@ -39,7 +40,6 @@ pub struct App {
 	registry_state: RegistryState,
 	seat_state: SeatState,
 	output_state: OutputState,
-	shm: Shm,
 	compositor: CompositorState,
 	session_lock_state: Option<SessionLockState>,
 	session_lock: Option<SessionLock>,
@@ -51,13 +51,18 @@ pub struct App {
 	test: bool,
 	exit: bool,
 	lock_denied: bool,
-	pool: SlotPool,
+	gpu: Gpu,
+	viewporter: Option<WpViewporter>,
+	/// Fatal surface-creation failure (Vulkan is a hard requirement); surfaced
+	/// as the process error after the session has been unlocked cleanly.
+	gpu_error: Option<GpuError>,
+	atlas: GlyphAtlas,
+	/// Start of the process; the reference for all animation time uniforms.
+	epoch: Instant,
 	surfaces: Vec<SurfaceEntry>,
 	ui: UiState,
 	config: LockConfig,
-	background: Option<Pixmap>,
 	fonts: Fonts,
-	scratch: Option<Pixmap>,
 	keyboard: Option<wl_keyboard::WlKeyboard>,
 	pointer: Option<wl_pointer::WlPointer>,
 	uid: u32,
@@ -74,15 +79,20 @@ pub struct App {
 
 struct SurfaceEntry {
 	kind: SurfaceKind,
+	viewport: Option<WpViewport>,
 	output: Option<wl_output::WlOutput>,
-	buffer: Option<Buffer>,
+	/// Swapchain surface, created lazily at the first configure.
+	gpu: Option<GpuSurface>,
+	/// Last built scene; rebuilt only when `scene_dirty` (state/size change),
+	/// not on pure animation frames.
+	scene: Option<Scene>,
+	scene_dirty: bool,
 	width: u32,
 	height: u32,
 	scale: i32,
 	primary: bool,
 	dirty: bool,
 	frame_pending: bool,
-	base: Option<Pixmap>,
 }
 
 enum SurfaceKind {
@@ -125,6 +135,7 @@ impl App {
 			return;
 		};
 		let surface = self.compositor.create_surface(qh);
+		let viewport = self.viewporter.as_ref().map(|vp| vp.get_viewport(&surface, qh, ()));
 		let lock_surface = lock.create_lock_surface(surface, output, qh);
 		let name = self.output_state.info(output).and_then(|info| info.name);
 		let primary = self.is_primary(name.as_deref());
@@ -133,15 +144,17 @@ impl App {
 		// protocol error.
 		self.surfaces.push(SurfaceEntry {
 			kind: SurfaceKind::Lock(lock_surface),
+			viewport,
 			output: Some(output.clone()),
-			buffer: None,
+			gpu: None,
+			scene: None,
+			scene_dirty: true,
 			width: 0,
 			height: 0,
 			scale: 1,
 			primary,
 			dirty: false,
 			frame_pending: false,
-			base: None,
 		});
 	}
 
@@ -152,6 +165,7 @@ impl App {
 			return;
 		};
 		let surface = self.compositor.create_surface(qh);
+		let viewport = self.viewporter.as_ref().map(|vp| vp.get_viewport(&surface, qh, ()));
 		let layer = layer_shell.create_layer_surface(qh, surface, Layer::Overlay, Some("redface-lock"), Some(output));
 		layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
 		layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
@@ -162,21 +176,24 @@ impl App {
 		layer.commit();
 		self.surfaces.push(SurfaceEntry {
 			kind: SurfaceKind::Test(layer),
+			viewport,
 			output: Some(output.clone()),
-			buffer: None,
+			gpu: None,
+			scene: None,
+			scene_dirty: true,
 			width: 0,
 			height: 0,
 			scale: 1,
 			primary,
 			dirty: false,
 			frame_pending: false,
-			base: None,
 		});
 	}
 
 	/// Marks the primary surface dirty and repaints immediately unless a frame
 	/// callback is already pending (in which case the frame handler repaints).
-	fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
+	/// State changed, so the scene is rebuilt rather than just redrawn.
+	fn request_redraw(&mut self, conn: &Connection, qh: &QueueHandle<Self>) {
 		if self.exit {
 			return;
 		}
@@ -185,117 +202,99 @@ impl App {
 				continue;
 			}
 			self.surfaces[index].dirty = true;
+			self.surfaces[index].scene_dirty = true;
 			if !self.surfaces[index].frame_pending {
-				self.draw(qh, index);
+				self.draw(conn, qh, index);
 			}
 		}
 	}
 
-	fn draw(&mut self, qh: &QueueHandle<Self>, index: usize) {
+	fn draw(&mut self, conn: &Connection, qh: &QueueHandle<Self>, index: usize) {
 		if self.exit {
 			return;
 		}
-		let (width, height) = {
+		let (width, height, scale) = {
 			let entry = &self.surfaces[index];
 			let scale = entry.scale.max(1) as u32;
-			(entry.width * scale, entry.height * scale)
+			(entry.width * scale, entry.height * scale, scale)
 		};
 		if width == 0 || height == 0 {
 			return;
 		}
 
-		// tiny-skia pixels are [r,g,b,a] bytes = wl_shm Abgr8888; fall back to a
-		// swizzled copy on compositors that only advertise the mandatory Argb8888.
-		let swap = !self.shm.formats().contains(&wl_shm::Format::Abgr8888);
-		let format = if swap {
-			wl_shm::Format::Argb8888
-		} else {
-			wl_shm::Format::Abgr8888
-		};
-		let stride = width as i32 * 4;
-
-		if self.surfaces[index]
-			.base
-			.as_ref()
-			.is_none_or(|p| p.width() != width || p.height() != height)
-		{
-			self.surfaces[index].base = ui::compose_background(width, height, self.background.as_ref(), &self.config);
-		}
-
-		if self.surfaces[index].buffer.is_none() {
-			let (buffer, _) = self
-				.pool
-				.create_buffer(width as i32, height as i32, stride, format)
-				.expect("create shm buffer");
-			self.surfaces[index].buffer = Some(buffer);
-		}
-		let primary = self.surfaces[index].primary;
-		let scale = self.surfaces[index].scale.max(1) as f32;
-		let base = self.surfaces[index].base.take().expect("background composed above");
-		let buffer = self.surfaces[index].buffer.as_mut().expect("buffer created above");
-		let canvas = match self.pool.canvas(buffer) {
-			Some(canvas) => canvas,
-			None => {
-				// Buffer still in use by the compositor: allocate a fresh one.
-				let (new_buffer, canvas) = self
-					.pool
-					.create_buffer(width as i32, height as i32, stride, format)
-					.expect("create shm buffer");
-				self.surfaces[index].buffer = Some(new_buffer);
-				canvas
+		// The swapchain surface is created on the first configure with a real
+		// size. Vulkan is a hard requirement: failure unlocks and exits.
+		if self.surfaces[index].gpu.is_none() {
+			match self
+				.gpu
+				.create_surface(conn, self.surfaces[index].kind.wl_surface(), width, height)
+			{
+				Ok(surface) => self.surfaces[index].gpu = Some(surface),
+				Err(err) => {
+					self.gpu_error = Some(err);
+					self.unlock();
+					return;
+				}
 			}
-		};
-
-		let view = ui::SurfaceView {
-			base: &base,
-			primary,
-			scale,
-		};
-		if swap {
-			let mut scratch = self
-				.scratch
-				.take()
-				.filter(|p| p.width() == width && p.height() == height)
-				.unwrap_or_else(|| Pixmap::new(width, height).expect("scratch pixmap"));
-			ui::render(
-				&mut scratch.as_mut(),
-				&view,
-				&self.ui,
-				&self.fonts,
-				&self.config,
-				Instant::now(),
-			);
-			for (dst, src) in canvas.chunks_exact_mut(4).zip(scratch.data().chunks_exact(4)) {
-				dst[0] = src[2];
-				dst[1] = src[1];
-				dst[2] = src[0];
-				dst[3] = src[3];
-			}
-			self.scratch = Some(scratch);
-		} else {
-			// Fast path: render straight into the shm buffer, one memcpy total.
-			let mut target = PixmapMut::from_bytes(canvas, width, height).expect("canvas pixmap");
-			ui::render(&mut target, &view, &self.ui, &self.fonts, &self.config, Instant::now());
 		}
-		self.surfaces[index].base = Some(base);
+		self.surfaces[index]
+			.gpu
+			.as_mut()
+			.expect("gpu surface created above")
+			.resize(&self.gpu, width, height);
+
+		// Rebuild the scene only when state, size, or the clock changed; pure
+		// animation frames just redraw with a fresh `time` uniform.
+		if self.surfaces[index].scene_dirty || self.surfaces[index].scene.is_none() {
+			let scene = if self.surfaces[index].primary {
+				ui::build_scene(
+					&self.ui,
+					&self.config,
+					&self.fonts,
+					&mut self.atlas,
+					width,
+					height,
+					scale as f32,
+					self.epoch,
+				)
+			} else {
+				// Secondary outputs show only the background.
+				Scene::default()
+			};
+			let pending = self.atlas.drain_pending();
+			if !pending.is_empty() {
+				self.gpu.upload_glyphs(&pending);
+			}
+			let entry = &mut self.surfaces[index];
+			entry.scene = Some(scene);
+			entry.scene_dirty = false;
+		}
+
+		let uniforms = Uniforms {
+			surface_size: [width as f32, height as f32],
+			bg_image_size: self.gpu.background_size(),
+			bg_color: color_uniform(self.config.background),
+			text_color: color_uniform(self.config.text_color),
+			box_color: color_uniform(self.config.box_color),
+			accent_color: color_uniform(self.config.accent_color),
+			time: self.epoch.elapsed().as_secs_f32(),
+			shake_start: self.ui.shake_start_secs(self.epoch),
+			face_toggled_at: self.ui.face_toggled_at_secs(self.epoch),
+			face_active: if self.ui.face_active { 1.0 } else { 0.0 },
+		};
 
 		let entry = &mut self.surfaces[index];
+		let surface = entry.gpu.as_mut().expect("gpu surface created above");
+		surface.render(&self.gpu, entry.scene.as_ref().expect("scene built above"), &uniforms);
+
 		let wl_surface = entry.kind.wl_surface().clone();
-		wl_surface.set_buffer_scale(entry.scale.max(1));
-		wl_surface.damage_buffer(0, 0, width as i32, height as i32);
 		wl_surface.frame(qh, FrameCallbackData(wl_surface.clone()));
 		entry.frame_pending = true;
 		entry.dirty = false;
-		entry
-			.buffer
-			.as_ref()
-			.expect("buffer")
-			.attach_to(&wl_surface)
-			.expect("attach buffer");
 		entry.kind.commit();
 	}
 
-	fn toggle_face(&mut self, qh: &QueueHandle<Self>) {
+	fn toggle_face(&mut self, conn: &Connection, qh: &QueueHandle<Self>) {
 		if let Some(face) = self.face.take() {
 			face.stop();
 			self.ui.set_face_active(false);
@@ -304,7 +303,7 @@ impl App {
 				Ok(wake) => wake,
 				Err(err) => {
 					self.ui.fail(format!("wake pipe failed: {err}"));
-					self.request_redraw(qh);
+					self.request_redraw(conn, qh);
 					return;
 				}
 			};
@@ -317,12 +316,12 @@ impl App {
 				Err(err) => self.ui.fail(format!("face unavailable: {err}")),
 			}
 		}
-		self.request_redraw(qh);
+		self.request_redraw(conn, qh);
 	}
 
-	fn submit(&mut self, qh: &QueueHandle<Self>) {
+	fn submit(&mut self, conn: &Connection, qh: &QueueHandle<Self>) {
 		if self.ui.is_empty() {
-			self.toggle_face(qh);
+			self.toggle_face(conn, qh);
 			return;
 		}
 		if self.pam_running.load(Ordering::Relaxed) {
@@ -342,10 +341,10 @@ impl App {
 				let _ = wake.write_all(&[1]);
 			});
 		}
-		self.request_redraw(qh);
+		self.request_redraw(conn, qh);
 	}
 
-	fn handle_key(&mut self, qh: &QueueHandle<Self>, event: &KeyEvent) {
+	fn handle_key(&mut self, conn: &Connection, qh: &QueueHandle<Self>, event: &KeyEvent) {
 		if event.keysym == Keysym::Escape {
 			// In test mode Escape unlocks and exits; locked, it clears the password.
 			if self.test {
@@ -356,7 +355,7 @@ impl App {
 		} else if event.keysym == Keysym::BackSpace {
 			self.ui.backspace();
 		} else if event.keysym == Keysym::Return || event.keysym == Keysym::KP_Enter {
-			self.submit(qh);
+			self.submit(conn, qh);
 			return;
 		} else if let Some(utf8) = &event.utf8 {
 			for c in utf8.chars() {
@@ -365,10 +364,10 @@ impl App {
 				}
 			}
 		}
-		self.request_redraw(qh);
+		self.request_redraw(conn, qh);
 	}
 
-	fn handle_auth(&mut self, qh: &QueueHandle<Self>, event: AuthEvent) {
+	fn handle_auth(&mut self, conn: &Connection, qh: &QueueHandle<Self>, event: AuthEvent) {
 		match event {
 			AuthEvent::Pam(Ok(())) | AuthEvent::Face(Ok(())) => self.unlock(),
 			AuthEvent::Pam(Err(msg)) => self.ui.fail(msg),
@@ -378,7 +377,7 @@ impl App {
 				self.ui.fail(msg);
 			}
 		}
-		self.request_redraw(qh);
+		self.request_redraw(conn, qh);
 	}
 
 	fn unlock(&mut self) {
@@ -393,10 +392,21 @@ impl App {
 	}
 }
 
+/// Config colors are 8-bit sRGB; shaders work in 0..1 floats (alpha is 1:
+/// everything the lock screen draws is opaque over its background).
+fn color_uniform(color: Color) -> [f32; 4] {
+	[
+		color.r as f32 / 255.0,
+		color.g as f32 / 255.0,
+		color.b as f32 / 255.0,
+		1.0,
+	]
+}
+
 impl CompositorHandler for App {
 	fn scale_factor_changed(
 		&mut self,
-		_: &Connection,
+		conn: &Connection,
 		qh: &QueueHandle<Self>,
 		surface: &wl_surface::WlSurface,
 		factor: i32,
@@ -405,10 +415,13 @@ impl CompositorHandler for App {
 			return;
 		};
 		let entry = &mut self.surfaces[index];
+		// A scale>1 swapchain only displays correctly when the viewport
+		// protocol downscales it back to the logical size.
+		let factor = if entry.viewport.is_some() { factor } else { 1 };
 		if entry.scale != factor {
 			entry.scale = factor;
-			entry.buffer = None;
-			self.draw(qh, index);
+			entry.scene_dirty = true;
+			self.draw(conn, qh, index);
 		}
 	}
 
@@ -421,14 +434,14 @@ impl CompositorHandler for App {
 	) {
 	}
 
-	fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+	fn frame(&mut self, conn: &Connection, qh: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
 		let Some(index) = self.surface_index(surface) else {
 			return;
 		};
 		self.surfaces[index].frame_pending = false;
 		let redraw = self.surfaces[index].dirty || (self.surfaces[index].primary && self.ui.animating(Instant::now()));
 		if redraw {
-			self.draw(qh, index);
+			self.draw(conn, qh, index);
 		}
 	}
 
@@ -467,7 +480,7 @@ impl OutputHandler for App {
 
 	fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 
-	fn output_destroyed(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+	fn output_destroyed(&mut self, conn: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
 		if let Some(index) = self
 			.surfaces
 			.iter()
@@ -479,7 +492,7 @@ impl OutputHandler for App {
 				first.primary = true;
 			}
 			if was_primary {
-				self.request_redraw(qh);
+				self.request_redraw(conn, qh);
 			}
 		}
 	}
@@ -504,7 +517,7 @@ impl SessionLockHandler for App {
 
 	fn configure(
 		&mut self,
-		_: &Connection,
+		conn: &Connection,
 		qh: &QueueHandle<Self>,
 		surface: SessionLockSurface,
 		configure: SessionLockSurfaceConfigure,
@@ -516,11 +529,14 @@ impl SessionLockHandler for App {
 		let (width, height) = configure.new_size;
 		let entry = &mut self.surfaces[index];
 		if entry.width != width || entry.height != height {
-			entry.buffer = None;
+			entry.scene_dirty = true;
 		}
 		entry.width = width;
 		entry.height = height;
-		self.draw(qh, index);
+		if let Some(viewport) = &entry.viewport {
+			viewport.set_destination(width as i32, height as i32);
+		}
+		self.draw(conn, qh, index);
 	}
 }
 
@@ -531,7 +547,7 @@ impl LayerShellHandler for App {
 
 	fn configure(
 		&mut self,
-		_: &Connection,
+		conn: &Connection,
 		qh: &QueueHandle<Self>,
 		layer: &LayerSurface,
 		configure: LayerSurfaceConfigure,
@@ -547,11 +563,14 @@ impl LayerShellHandler for App {
 		}
 		let entry = &mut self.surfaces[index];
 		if entry.width != width || entry.height != height {
-			entry.buffer = None;
+			entry.scene_dirty = true;
 		}
 		entry.width = width;
 		entry.height = height;
-		self.draw(qh, index);
+		if let Some(viewport) = &entry.viewport {
+			viewport.set_destination(width as i32, height as i32);
+		}
+		self.draw(conn, qh, index);
 	}
 }
 
@@ -618,18 +637,18 @@ impl KeyboardHandler for App {
 
 	fn press_key(
 		&mut self,
-		_: &Connection,
+		conn: &Connection,
 		qh: &QueueHandle<Self>,
 		_: &wl_keyboard::WlKeyboard,
 		_: u32,
 		event: KeyEvent,
 	) {
-		self.handle_key(qh, &event);
+		self.handle_key(conn, qh, &event);
 	}
 
 	fn repeat_key(
 		&mut self,
-		_: &Connection,
+		conn: &Connection,
 		qh: &QueueHandle<Self>,
 		_: &wl_keyboard::WlKeyboard,
 		_: u32,
@@ -637,7 +656,7 @@ impl KeyboardHandler for App {
 	) {
 		// Only editing keys repeat; Enter and Escape act on press only.
 		if event.keysym == Keysym::BackSpace || event.utf8.is_some() {
-			self.handle_key(qh, &event);
+			self.handle_key(conn, qh, &event);
 		}
 	}
 
@@ -660,7 +679,7 @@ impl KeyboardHandler for App {
 impl PointerHandler for App {
 	fn pointer_frame(
 		&mut self,
-		_: &Connection,
+		conn: &Connection,
 		qh: &QueueHandle<Self>,
 		_: &wl_pointer::WlPointer,
 		events: &[PointerEvent],
@@ -678,29 +697,23 @@ impl PointerHandler for App {
 					let hover = ui::hit_face(&lay, event.position.0, event.position.1);
 					if hover != self.ui.hover_face {
 						self.ui.hover_face = hover;
-						self.request_redraw(qh);
+						self.request_redraw(conn, qh);
 					}
 				}
 				PointerEventKind::Leave { .. } => {
 					if self.ui.hover_face {
 						self.ui.hover_face = false;
-						self.request_redraw(qh);
+						self.request_redraw(conn, qh);
 					}
 				}
 				PointerEventKind::Press { button, .. }
 					if button == BTN_LEFT && ui::hit_face(&lay, event.position.0, event.position.1) =>
 				{
-					self.toggle_face(qh);
+					self.toggle_face(conn, qh);
 				}
 				_ => {}
 			}
 		}
-	}
-}
-
-impl ShmHandler for App {
-	fn shm_state(&mut self) -> &mut Shm {
-		&mut self.shm
 	}
 }
 
@@ -714,14 +727,25 @@ impl ProvidesRegistryState for App {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(App);
+wayland_client::delegate_noop!(App: ignore WpViewporter);
+wayland_client::delegate_noop!(App: ignore WpViewport);
 
-pub fn run(config: LockConfig, background: Option<Pixmap>, fonts: Fonts, test: bool) -> Result<(), Box<dyn Error>> {
+pub fn run(
+	config: LockConfig,
+	background: Option<(Vec<u8>, u32, u32)>,
+	fonts: Fonts,
+	test: bool,
+) -> Result<(), Box<dyn Error>> {
 	let conn = Connection::connect_to_env()?;
 	let (globals, mut event_queue) = registry_queue_init(&conn)?;
 	let qh = event_queue.handle();
 
+	// Vulkan is a hard requirement: no adapter/device, no lock screen.
+	let mut gpu = Gpu::new()?;
+	gpu.set_background(background.as_ref().map(|(data, w, h)| (data.as_slice(), *w, *h)));
+
 	let compositor = CompositorState::bind(&globals, &qh)?;
-	let shm = Shm::bind(&globals, &qh)?;
+	let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
 	let session_lock_state = if test {
 		None
 	} else {
@@ -732,7 +756,6 @@ pub fn run(config: LockConfig, background: Option<Pixmap>, fonts: Fonts, test: b
 	} else {
 		None
 	};
-	let pool = SlotPool::new(256 * 256 * 4, &shm)?;
 
 	let (auth_tx, auth_rx) = mpsc::channel();
 	let (wake_tx, wake_rx) = UnixStream::pair()?;
@@ -747,7 +770,6 @@ pub fn run(config: LockConfig, background: Option<Pixmap>, fonts: Fonts, test: b
 		registry_state: RegistryState::new(&globals),
 		seat_state: SeatState::new(&globals, &qh),
 		output_state: OutputState::new(&globals, &qh),
-		shm,
 		compositor,
 		session_lock_state,
 		session_lock: None,
@@ -756,13 +778,15 @@ pub fn run(config: LockConfig, background: Option<Pixmap>, fonts: Fonts, test: b
 		test,
 		exit: false,
 		lock_denied: false,
-		pool,
+		gpu,
+		viewporter,
+		gpu_error: None,
+		atlas: GlyphAtlas::new(),
+		epoch: Instant::now(),
 		surfaces: Vec::new(),
 		ui: UiState::new(),
 		config,
-		background,
 		fonts,
-		scratch: None,
 		keyboard: None,
 		pointer: None,
 		uid,
@@ -841,13 +865,15 @@ pub fn run(config: LockConfig, background: Option<Pixmap>, fonts: Fonts, test: b
 			}
 		}
 		while let Ok(event) = app.auth_rx.try_recv() {
-			app.handle_auth(&qh, event);
+			app.handle_auth(&conn, &qh, event);
 		}
 
+		// Clock text changes once a minute; that is a scene rebuild, not just
+		// a redraw.
 		let minute = ui::local_now().min;
 		if minute != app.last_minute {
 			app.last_minute = minute;
-			app.request_redraw(&qh);
+			app.request_redraw(&conn, &qh);
 		}
 	}
 
@@ -857,6 +883,9 @@ pub fn run(config: LockConfig, background: Option<Pixmap>, fonts: Fonts, test: b
 		event_queue.roundtrip(&mut app)?;
 	}
 	conn.flush()?;
+	if let Some(err) = app.gpu_error {
+		return Err(err.into());
+	}
 	if app.lock_denied {
 		return Err("the compositor denied the session lock (ext-session-lock-v1 unsupported?)".into());
 	}

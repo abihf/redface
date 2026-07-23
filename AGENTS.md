@@ -33,8 +33,12 @@ built — do not treat it as live code).
 - `crates/redface-record` — enrollment CLI (`redface-record`), writes `.face` files.
 - `crates/redface-check` — CLI client that asks the daemon to authenticate.
 - `crates/redface-lock` — Wayland session locker (`ext-session-lock-v1`, works on
-  Hyprland). Software-rendered (smithay-client-toolkit + tiny-skia + ab_glyph +
-  fontdb; no GPU/toolkit). Passwords go through the `redface-lock` PAM service
+  Hyprland). Rendered with wgpu on Vulkan (smithay-client-toolkit for the
+  Wayland side; WGSL shaders in `shaders/`, loaded via `include_str!`); Vulkan
+  is a hard requirement — there is no CPU fallback, so a working Vulkan
+  driver/ICD is needed at runtime. Animations are evaluated in shaders from
+  time uniforms; text is rasterized with ab_glyph into a glyph atlas. Passwords
+  go through the `redface-lock` PAM service
   (minimal client-side FFI in `src/auth.rs`; pam-client/pam-sys bindgen against
   libclang, which conflicts with this workspace's clang `runtime` feature). Face
   unlock talks to redfaced over the socket (toggling it off drops the connection,
