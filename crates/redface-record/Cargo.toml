@@ -16,5 +16,7 @@ name = "redface-record"
 path = "src/main.rs"
 
 [features]
+default = ["ncnn"]
+ncnn = ["redface-recognition/ncnn"]
 openvino = ["redface-recognition/openvino"]
 

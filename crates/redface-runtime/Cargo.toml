@@ -14,4 +14,6 @@ serde_json = { workspace = true }
 path = "src/lib.rs"
 
 [features]
+default = ["ncnn"]
+ncnn = ["redface-recognition/ncnn"]
 openvino = ["redface-recognition/openvino"]

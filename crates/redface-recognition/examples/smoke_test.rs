@@ -1,8 +1,11 @@
-// Smoke test: loads the real ONNX models through the active backend (OpenCV
-// DNN CPU by default, OpenVINO when built with --features openvino) and runs
-// one inference pass. Run: cargo run -p redface-recognition --example smoke_test
-// DEVICE only selects the OpenVINO device on openvino builds (default: NPU,
-// falls back to CPU); the default OpenCV DNN CPU backend ignores it.
+// Smoke test: loads the real models through the active backend (ncnn by
+// default, OpenVINO when built with --no-default-features --features
+// openvino) and runs one inference pass. The default ncnn backend reads
+// data/*.param/.bin (see `make convert-models`); OpenVINO reads the .onnx.
+// Run: cargo run -p redface-recognition --example smoke_test
+// DEVICE selects the inference target: on OpenVINO builds the device
+// (default: NPU, falls back to CPU); on the default ncnn backend NPU/AUTO
+// mean the Vulkan GPU (CPU fallback), CPU forces CPU.
 // FRAME=blank (default) uses a flat gray frame and asserts no detections;
 // FRAME=noise uses a deterministic noise frame and only prints the count.
 use redface_recognition::{DevicePref, Recognizer};

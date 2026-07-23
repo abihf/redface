@@ -14,4 +14,6 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [features]
+default = ["ncnn"]
+ncnn = ["redface-runtime/ncnn"]
 openvino = ["redface-runtime/openvino"]

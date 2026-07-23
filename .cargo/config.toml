@@ -5,3 +5,8 @@ rustflags = ["-C", "target-cpu=native"]
 # The system OpenCV 5 pkg-config file is opencv5.pc; the opencv crate probes
 # opencv4 by default.
 OPENCV_PKGCONFIG_NAME = "opencv5"
+# ncnn-bind (rust-ncnn) builds against the system ncnn instead of cloning and
+# compiling its own: headers in $NCNN_DIR/include/ncnn, libncnn in
+# $NCNN_DIR/lib. Without this the build script git-clones Tencent/ncnn and
+# cmake-builds it.
+NCNN_DIR = "/usr"

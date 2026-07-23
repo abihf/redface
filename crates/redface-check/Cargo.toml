@@ -12,4 +12,6 @@ name = "redface-check"
 path = "src/main.rs"
 
 [features]
+default = ["ncnn"]
+ncnn = ["redface-runtime/ncnn"]
 openvino = ["redface-runtime/openvino"]

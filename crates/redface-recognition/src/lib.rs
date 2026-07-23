@@ -11,6 +11,11 @@ pub use redface_core::{DESCRIPTOR_LEN, Descriptor};
 
 mod simd;
 
+#[cfg(not(any(feature = "ncnn", feature = "openvino")))]
+compile_error!("no inference backend: enable the `ncnn` (default) or `openvino` feature");
+#[cfg(all(feature = "ncnn", feature = "openvino"))]
+compile_error!("features `ncnn` and `openvino` are mutually exclusive; for OpenVINO build with --no-default-features --features openvino");
+
 // Model files distributed in the InsightFace `buffalo_l` pack:
 // https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
 //
@@ -46,9 +51,10 @@ pub struct Face {
 	pub descriptor: Descriptor,
 }
 
-/// Preferred inference device, configured per deployment. Only meaningful on
-/// the OpenVINO backend (opt-in `openvino` feature); default builds run every
-/// preference on the OpenCV DNN CPU backend.
+/// Preferred inference device, configured per deployment. On the OpenVINO
+/// backend (opt-in `openvino` feature) it selects the OpenVINO device; on the
+/// default ncnn backend `Npu`/`Auto` request the Vulkan GPU (with automatic
+/// CPU fallback when no Vulkan device is present) and `Cpu` forces CPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DevicePref {
 	/// OpenVINO "NPU" device (Intel NPU, e.g. Arrow Lake); falls back to CPU
@@ -128,9 +134,10 @@ impl fmt::Display for RecognizerError {
 
 impl std::error::Error for RecognizerError {}
 
-/// A model loaded for inference. Two backends exist: OpenCV's DNN module
-/// (CPU), the default used for every device preference, and OpenVINO (NPU
-/// with CPU fallback), enabled by the opt-in `openvino` feature.
+/// A model loaded for inference. Two backends exist: ncnn on the Vulkan GPU
+/// (the default, with automatic CPU fallback; safe wrapper in `crates/ncnn`),
+/// and OpenVINO (NPU with CPU fallback), enabled by the opt-in `openvino`
+/// feature. The two features are mutually exclusive.
 enum ModelRunner {
 	/// A compiled OpenVINO model together with its input port name and infer
 	/// request.
@@ -141,21 +148,22 @@ enum ModelRunner {
 		request: InferRequest,
 		num_outputs: usize,
 	},
-	/// An OpenCV DNN network together with its output layer names; `detector`
-	/// selects the 9-branch SCRFD output handling.
-	#[cfg(not(feature = "openvino"))]
-	Dnn {
-		net: dnn::Net,
-		out_names: opencv::core::Vector<String>,
+	/// An ncnn network with its input blob name and output blob names (parsed
+	/// from the `.param` graph); `detector` selects the 9-branch SCRFD output
+	/// handling.
+	#[cfg(feature = "ncnn")]
+	Ncnn {
+		net: ncnn::Net,
+		input_name: String,
+		output_names: Vec<String>,
 		detector: bool,
 	},
 }
 
 impl ModelRunner {
 	/// Runs one forward pass on the NCHW f32 blob and returns the model's
-	/// output Mats in canonical branch order. On the DNN backend the Mats
-	/// come straight from `net.forward()` (zero-copy); on OpenVINO the
-	/// tensor data is copied into Mats.
+	/// output Mats in canonical branch order. On the ncnn backend the output
+	/// blob data is copied into Mats; on OpenVINO the tensor data is.
 	fn infer(&mut self, input: &Mat) -> Result<Vec<Mat>, RecognizerError> {
 		match self {
 			#[cfg(feature = "openvino")]
@@ -177,23 +185,58 @@ impl ModelRunner {
 					let data = output.get_data::<f32>().map_err(inference_error)?;
 					let mut mat = Mat::new_rows_cols_with_default(1, data.len() as i32, CV_32F, Scalar::default())
 						.map_err(inference_error)?;
-					mat.data_typed_mut::<f32>().map_err(inference_error)?.copy_from_slice(data);
+					mat.data_typed_mut::<f32>()
+						.map_err(inference_error)?
+						.copy_from_slice(data);
 					outputs.push(mat);
 				}
 				Ok(outputs)
 			}
-			#[cfg(not(feature = "openvino"))]
-			Self::Dnn {
+			#[cfg(feature = "ncnn")]
+			Self::Ncnn {
 				net,
-				out_names,
+				input_name,
+				output_names,
 				detector,
 			} => {
-				net.set_input(input, "", 1.0, Scalar::default())
-					.map_err(inference_error)?;
+				let dims = input.mat_size();
+				let dims: &[i32] = &dims;
+				let [_, channels, height, width] = *dims else {
+					return Err(RecognizerError::Inference(format!(
+						"unexpected input blob dims {dims:?}"
+					)));
+				};
+				let data = input.data_typed::<f32>().map_err(inference_error)?;
+				let in_mat = ncnn::Mat::from_float_3d(width, height, channels, data).map_err(inference_error)?;
+				// All outputs are read from one extractor so the graph is
+				// evaluated once.
+				let mut extractor = net.create_extractor();
+				extractor.input(input_name, &in_mat).map_err(inference_error)?;
+
+				// Wrap each output blob in a 2D [entries, cols] Mat so the
+				// detector branches can be classified by shape, exactly as the
+				// old DNN path did. SCRFD/ArcFace outputs are 2D
+				// [entries, width]; a squeezed single-value branch may be 1D
+				// [entries] (width 1).
 				let mut mats = opencv::core::Vector::<Mat>::new();
-				let mut output_array =
-					opencv::core::_OutputArray::from_mat_vec_mut(&mut mats).map_err(inference_error)?;
-				net.forward(&mut output_array, out_names).map_err(inference_error)?;
+				for name in output_names {
+					let out = extractor.extract(name).map_err(inference_error)?;
+					let (entries, cols) = match out.dims() {
+						1 => (out.w(), 1),
+						2 => (out.h(), out.w()),
+						other => {
+							return Err(RecognizerError::Inference(format!(
+								"unexpected ncnn output dims {other}"
+							)));
+						}
+					};
+					let mut mat = Mat::new_rows_cols_with_default(entries, cols, CV_32F, Scalar::default())
+						.map_err(inference_error)?;
+					mat.data_typed_mut::<f32>()
+						.map_err(inference_error)?
+						.copy_from_slice(out.as_f32());
+					mats.push(mat);
+				}
 
 				if *detector {
 					canonical_detector_order(mats)
@@ -206,8 +249,8 @@ impl ModelRunner {
 }
 
 /// Runs SCRFD detection + ArcFace encoding on grayscale frames. Inference backend
-/// depends on the build: OpenCV DNN on CPU by default, OpenVINO (honoring
-/// `DevicePref`) with the opt-in `openvino` feature.
+/// depends on the build: ncnn on the Vulkan GPU by default (CPU fallback),
+/// OpenVINO (honoring `DevicePref`) with the opt-in `openvino` feature.
 pub struct Recognizer {
 	// The core must outlive the compiled models.
 	#[cfg(feature = "openvino")]
@@ -222,9 +265,10 @@ pub struct Recognizer {
 }
 
 impl Recognizer {
-	/// Loads both models from `model_dir`. By default they run on the OpenCV
-	/// DNN CPU backend whatever `device` says; with the opt-in `openvino`
-	/// feature they run through OpenVINO on `device` (NPU falls back to CPU).
+	/// Loads both models from `model_dir`. On the default ncnn backend `device`
+	/// selects the compute target (Vulkan GPU for `Npu`/`Auto`, CPU for `Cpu`);
+	/// with the opt-in `openvino` feature they run through OpenVINO on `device`
+	/// (NPU falls back to CPU).
 	pub fn new(model_dir: impl AsRef<Path>, device: DevicePref) -> Result<Self, RecognizerError> {
 		let model_dir = model_dir.as_ref();
 		let detector_path = model_dir.join(DETECTOR_MODEL);
@@ -257,12 +301,17 @@ impl Recognizer {
 			})
 		}
 
-		#[cfg(not(feature = "openvino"))]
+		#[cfg(feature = "ncnn")]
 		{
-			eprintln!("redface: using OpenCV DNN CPU backend (build with --features openvino for OpenVINO/NPU)");
-			let _ = device; // All preferences map to the DNN CPU backend.
-			let detector = build_dnn_runner(&detector_path, true)?;
-			let encoder = build_dnn_runner(&encoder_path, false)?;
+			let backend = match device {
+				DevicePref::Cpu => "ncnn CPU backend",
+				DevicePref::Npu | DevicePref::Auto => "ncnn Vulkan GPU backend (CPU fallback if no Vulkan device)",
+			};
+			eprintln!(
+				"redface: using {backend} (build with --no-default-features --features openvino for OpenVINO/NPU)"
+			);
+			let detector = build_ncnn_runner(&detector_path, true, device)?;
+			let encoder = build_ncnn_runner(&encoder_path, false, device)?;
 
 			Ok(Self {
 				detector,
@@ -373,8 +422,7 @@ impl Recognizer {
 	/// NCHW f32 blob Mat, BGR order, normalized (x - 127.5) / 127.5.
 	fn align_face(&mut self, landmarks: &[(f32, f32); 5]) -> Result<Mat, RecognizerError> {
 		let m = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
-		let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]])
-			.map_err(inference_error)?;
+		let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).map_err(inference_error)?;
 
 		let size = Size::new(ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32);
 		imgproc::warp_affine(
@@ -399,9 +447,10 @@ impl Recognizer {
 	fn equalize_frame(&mut self, img_data: &[u8], width: i32, height: i32) -> Result<(), RecognizerError> {
 		// SAFETY: `img_data` outlives `frame`, OpenCV never frees external data,
 		// and `frame` is only used as a const CLAHE source.
-		let frame =
-			unsafe { Mat::new_rows_cols_with_data_unsafe_def(height, width, CV_8UC1, img_data.as_ptr() as *mut c_void) }
-				.map_err(inference_error)?;
+		let frame = unsafe {
+			Mat::new_rows_cols_with_data_unsafe_def(height, width, CV_8UC1, img_data.as_ptr() as *mut c_void)
+		}
+		.map_err(inference_error)?;
 
 		self.clahe.apply(&frame, &mut self.equalized).map_err(inference_error)?;
 		imgproc::cvt_color_def(&self.equalized, &mut self.rgb, imgproc::COLOR_GRAY2RGB).map_err(inference_error)?;
@@ -451,43 +500,124 @@ fn build_runner(
 	})
 }
 
-/// Loads the ONNX model at `path` for OpenCV's DNN CPU backend. Unlike the
-/// NPU plugin, OpenCV DNN handles the models' dynamic input shapes as-is, so
-/// no reshape happens — but only its new graph engine does (the classic
-/// engine rejects the detector's dynamic Shape nodes, so the AUTO default is
-/// kept). `detector` selects the 9-branch SCRFD output handling.
-#[cfg(not(feature = "openvino"))]
-fn build_dnn_runner(path: &Path, detector: bool) -> Result<ModelRunner, RecognizerError> {
-	let model_error = |err: opencv::Error| RecognizerError::ModelLoad {
+/// Loads the ncnn model derived from the ONNX model at `path` (same stem,
+/// `.param` graph + `.bin` weights, produced by `make convert-models`). ncnn
+/// runs on the Vulkan GPU for `DevicePref::Npu`/`Auto` (falling back to CPU
+/// automatically when no Vulkan device is present) and on CPU for
+/// `DevicePref::Cpu`. `detector` selects the 9-branch SCRFD output handling.
+#[cfg(feature = "ncnn")]
+fn build_ncnn_runner(path: &Path, detector: bool, device: DevicePref) -> Result<ModelRunner, RecognizerError> {
+	let model_error = |message: String| RecognizerError::ModelLoad {
 		path: path.to_path_buf(),
-		message: err.to_string(),
+		message,
 	};
-
-	let path_str = path.to_str().ok_or_else(|| RecognizerError::ModelLoad {
-		path: path.to_path_buf(),
-		message: "path is not valid UTF-8".to_owned(),
-	})?;
-
-	let mut net = dnn::read_net_from_onnx_def(path_str).map_err(model_error)?;
-	net.set_preferable_backend(dnn::DNN_BACKEND_OPENCV)
-		.map_err(model_error)?;
-
-	let out_names = net
-		.get_unconnected_out_layers_names()
-		.map_err(model_error)?;
-	if detector && out_names.len() != 9 {
-		let names: Vec<String> = out_names.iter().collect();
-		return Err(RecognizerError::ModelLoad {
+	fn utf8(path: &Path) -> Result<&str, RecognizerError> {
+		path.to_str().ok_or_else(|| RecognizerError::ModelLoad {
 			path: path.to_path_buf(),
-			message: format!("expected 9 outputs, got: {}", names.join(", ")),
-		});
+			message: "path is not valid UTF-8".to_owned(),
+		})
 	}
 
-	Ok(ModelRunner::Dnn {
+	let param_path = path.with_extension("param");
+	let bin_path = path.with_extension("bin");
+
+	let mut net = ncnn::Net::new();
+	// Select the compute target before loading so ncnn builds its Vulkan
+	// pipelines during load_param: Vulkan GPU for Npu/Auto (ncnn falls back to
+	// CPU automatically when no Vulkan device is present), CPU for Cpu.
+	net.set_use_vulkan_compute(!matches!(device, DevicePref::Cpu));
+	net.load_param(utf8(&param_path)?).map_err(|err| model_error(err.to_string()))?;
+	net.load_model(utf8(&bin_path)?).map_err(|err| model_error(err.to_string()))?;
+
+	let (input_name, output_names) = parse_ncnn_param(&param_path)?;
+	if detector && output_names.len() != 9 {
+		return Err(model_error(format!(
+			"expected 9 outputs in '{}', got {}",
+			param_path.display(),
+			output_names.len()
+		)));
+	}
+
+	Ok(ModelRunner::Ncnn {
 		net,
-		out_names,
+		input_name,
+		output_names,
 		detector,
 	})
+}
+
+/// Parses an ncnn `.param` graph to recover the network's input blob name (the
+/// `Input` layer's output) and its output blob names — the blobs produced but
+/// never consumed by another layer. The ONNX output tensor ids become ncnn blob
+/// names, so (as with the old DNN path) the detector branches are classified by
+/// shape rather than by name in `canonical_detector_order`.
+#[cfg(feature = "ncnn")]
+fn parse_ncnn_param(path: &Path) -> Result<(String, Vec<String>), RecognizerError> {
+	let param_error = |message: String| RecognizerError::ModelLoad {
+		path: path.to_path_buf(),
+		message,
+	};
+	let text = std::fs::read_to_string(path).map_err(|e| param_error(e.to_string()))?;
+	let mut lines = text.lines();
+	// Line 0 is the magic number, line 1 the layer/blob counts.
+	let _ = lines.next();
+	let _ = lines.next();
+
+	let mut input_name: Option<String> = None;
+	let mut produced: Vec<String> = Vec::new();
+	let mut produced_set = std::collections::HashSet::new();
+	let mut consumed = std::collections::HashSet::new();
+
+	for line in lines {
+		// <type> <name> <in_count> <out_count> <in blobs...> <out blobs...> <params...>
+		let tokens: Vec<&str> = line.split_whitespace().collect();
+		if tokens.len() < 4 {
+			continue;
+		}
+		let Ok(in_count) = tokens[2].parse::<usize>() else {
+			continue;
+		};
+		let Ok(out_count) = tokens[3].parse::<usize>() else {
+			continue;
+		};
+		if tokens.len() < 4 + in_count + out_count {
+			continue;
+		}
+		let inputs = &tokens[4..4 + in_count];
+		let outputs = &tokens[4 + in_count..4 + in_count + out_count];
+
+		if tokens[0] == "Input"
+			&& let Some(blob) = outputs.first()
+		{
+			input_name.get_or_insert_with(|| (*blob).to_owned());
+		}
+		for blob in inputs {
+			consumed.insert((*blob).to_owned());
+		}
+		for blob in outputs {
+			if produced_set.insert((*blob).to_owned()) {
+				produced.push((*blob).to_owned());
+			}
+		}
+	}
+
+	let input_name = input_name.ok_or_else(|| param_error("no Input layer found".to_owned()))?;
+	let check_name = |name: String| {
+		if name.contains('\0') {
+			return Err(RecognizerError::ModelLoad {
+				path: path.to_path_buf(),
+				message: format!("blob name '{name}' contains an interior NUL byte"),
+			});
+		}
+		Ok(name)
+	};
+	let output_names = produced
+		.into_iter()
+		.filter(|blob| !consumed.contains(blob))
+		.map(check_name)
+		.collect::<Result<Vec<_>, _>>()?;
+
+	Ok((check_name(input_name)?, output_names))
 }
 
 /// Reorders the detector's 9 outputs into the canonical decode order
@@ -497,7 +627,7 @@ fn build_dnn_runner(path: &Path, detector: bool) -> Result<ModelRunner, Recogniz
 /// by shape instead: [entries, width] with entries = 2 anchors per
 /// feature-map point identifying the stride and width identifying the kind
 /// (1 score / 4 bbox / 10 kps values).
-#[cfg(not(feature = "openvino"))]
+#[cfg(feature = "ncnn")]
 fn canonical_detector_order(mats: opencv::core::Vector<Mat>) -> Result<Vec<Mat>, RecognizerError> {
 	let mut slots: [Option<Mat>; 9] = Default::default();
 	for mat in mats {
@@ -521,7 +651,7 @@ fn canonical_detector_order(mats: opencv::core::Vector<Mat>) -> Result<Vec<Mat>,
 
 /// Canonical branch index for a detector output of shape `dims`
 /// ([entries, width]), see `canonical_detector_order`.
-#[cfg(not(feature = "openvino"))]
+#[cfg(feature = "ncnn")]
 fn detector_branch_index(dims: &[i32]) -> Option<usize> {
 	let [entries, width] = *dims else {
 		return None;
@@ -731,14 +861,20 @@ fn similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> [f32; 6
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use opencv::core::{Vec3b, CV_8UC3};
+	use opencv::core::{CV_8UC3, Vec3b};
 
 	/// Test helper: CLAHE + GRAY2RGB on a grayscale buffer, without a full
 	/// Recognizer (no models needed).
-	fn equalize_gray(clahe: &mut Ptr<imgproc::CLAHE>, img_data: &[u8], width: i32, height: i32) -> Result<Mat, RecognizerError> {
-		let frame =
-			unsafe { Mat::new_rows_cols_with_data_unsafe_def(height, width, CV_8UC1, img_data.as_ptr() as *mut c_void) }
-				.map_err(inference_error)?;
+	fn equalize_gray(
+		clahe: &mut Ptr<imgproc::CLAHE>,
+		img_data: &[u8],
+		width: i32,
+		height: i32,
+	) -> Result<Mat, RecognizerError> {
+		let frame = unsafe {
+			Mat::new_rows_cols_with_data_unsafe_def(height, width, CV_8UC1, img_data.as_ptr() as *mut c_void)
+		}
+		.map_err(inference_error)?;
 		let mut equalized = Mat::default();
 		clahe.apply(&frame, &mut equalized).map_err(inference_error)?;
 		let mut rgb = Mat::default();
@@ -763,8 +899,7 @@ mod tests {
 	/// Test helper: warp + blob_from_image for the encoder, without a Recognizer.
 	fn make_aligned_blob(rgb: &Mat, landmarks: &[(f32, f32); 5]) -> Result<Mat, RecognizerError> {
 		let m = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
-		let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]])
-			.map_err(inference_error)?;
+		let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).map_err(inference_error)?;
 		let size = Size::new(ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32);
 		let mut crop = Mat::default();
 		imgproc::warp_affine(
@@ -778,8 +913,7 @@ mod tests {
 			AlgorithmHint::ALGO_HINT_DEFAULT,
 		)
 		.map_err(inference_error)?;
-		dnn::blob_from_image(&crop, 1.0 / 127.5, size, Scalar::all(127.5), true, false, CV_32F)
-			.map_err(inference_error)
+		dnn::blob_from_image(&crop, 1.0 / 127.5, size, Scalar::all(127.5), true, false, CV_32F).map_err(inference_error)
 	}
 
 	#[test]

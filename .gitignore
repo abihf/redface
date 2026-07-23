@@ -1,4 +1,6 @@
 capture.face
 target
 *.onnx
+*.param
+*.bin
 .venv

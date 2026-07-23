@@ -1,0 +1,18 @@
+[package]
+name = "ncnn-bind"
+version = "0.1.1"
+edition = "2021"
+authors = ["tpoisonooo <khj.application@aliyun.com>"]
+description = "ncnn Rust binding (vendored from rust-ncnn; build script updated for a modern bindgen)"
+homepage = "https://github.com/tpoisonooo/rust-ncnn"
+repository = "https://github.com/tpoisonooo/rust-ncnn"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+# Upstream pins bindgen 0.59, which panics on current glibc headers
+# (`__mbstate_t` anonymous union). The vendored build.rs uses a modern bindgen
+# against the system ncnn instead of cloning and cmake-building ncnn.
+bindgen = { version = "0.71", default-features = false, features = ["runtime"] }

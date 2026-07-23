@@ -9,12 +9,20 @@ openvino = { version = "0.11", optional = true }
 # `runtime` feature; without this the opencv build script panics under
 # workspace-wide feature unification.
 opencv = { version = "0.99", default-features = false, features = ["imgproc", "dnn", "clang-runtime"] }
+# ncnn is a safe wrapper (crates/ncnn) over the vendored rust-ncnn FFI
+# (crates/ncnn-bind, https://github.com/tpoisonooo/rust-ncnn). The default
+# backend runs inference through ncnn (Vulkan GPU, CPU fallback); the wrapper
+# keeps all the FFI `unsafe` out of this crate. OpenVINO builds use
+# --no-default-features so this dependency (and its libncnn link) drops out.
+ncnn = { path = "../ncnn", optional = true }
 redface-core = { workspace = true }
 
-# Default builds run inference on OpenCV's DNN CPU backend with no OpenVINO
-# dependency. The opt-in `openvino` feature runs inference through OpenVINO
-# instead (NPU with CPU fallback).
+# Default builds run inference on ncnn (Vulkan GPU, CPU fallback) with no
+# OpenVINO dependency. The opt-in `openvino` feature runs inference through
+# OpenVINO instead (NPU with CPU fallback).
 [features]
+default = ["ncnn"]
+ncnn = ["dep:ncnn"]
 openvino = ["dep:openvino"]
 
 [lib]

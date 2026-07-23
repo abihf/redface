@@ -1,0 +1,11 @@
+[package]
+name = "ncnn"
+version = "0.1.0"
+edition = "2024"
+description = "Safe Rust wrapper around the ncnn inference engine (wraps the vendored ncnn-bind FFI)"
+
+[dependencies]
+ncnn-bind = { path = "../ncnn-bind" }
+
+[lib]
+path = "src/lib.rs"
