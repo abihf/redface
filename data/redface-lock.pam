@@ -1,0 +1,5 @@
+# PAM stack for redface-lock password authentication.
+# Face unlock does not go through PAM: the locker talks to redfaced directly.
+# If your distro has no system-auth include, replace with:
+#   auth  required  pam_unix.so
+auth  include  system-auth

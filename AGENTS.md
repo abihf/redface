@@ -32,6 +32,18 @@ built — do not treat it as live code).
   protocol, and the `verify()` loop shared by daemon and tools.
 - `crates/redface-record` — enrollment CLI (`redface-record`), writes `.face` files.
 - `crates/redface-check` — CLI client that asks the daemon to authenticate.
+- `crates/redface-lock` — Wayland session locker (`ext-session-lock-v1`, works on
+  Hyprland). Software-rendered (smithay-client-toolkit + tiny-skia + ab_glyph +
+  fontdb; no GPU/toolkit). Passwords go through the `redface-lock` PAM service
+  (minimal client-side FFI in `src/auth.rs`; pam-client/pam-sys bindgen against
+  libclang, which conflicts with this workspace's clang `runtime` feature). Face
+  unlock talks to redfaced over the socket (toggling it off drops the connection,
+  which the daemon treats as cancel). `--test` covers all outputs with
+  wlr-layer-shell overlay surfaces (no session lock; Esc exits) so the UI can
+  be tried without valid credentials. Config: `~/.config/redface/lock.json`
+  (`background`, `background_image`, `primary_output`, colors; all optional).
+  Only the primary output shows the UI; other outputs draw the background.
+  Animations run off `wl_surface.frame` callbacks at native refresh.
 - `crates/redfaced` — daemon: owns the camera, serves auth requests on
   `/var/run/redface.sock`.
 - `crates/pam-redface` — PAM module (`libpam_redface.so`), talks to the daemon.
@@ -44,7 +56,7 @@ built — do not treat it as live code).
 
 ```sh
 cargo build --workspace          # debug (ncnn Vulkan GPU backend, no OpenVINO)
-make build                       # release binaries (pam, daemon, check, record)
+make build                       # release binaries (pam, daemon, check, record, lock)
 cargo test --workspace           # full test suite
 make fetch-data                  # download ONNX models into data/
 make convert-models              # convert to ncnn .param/.bin via pnnx (smoke test)
@@ -66,7 +78,9 @@ bindings with libclang at build time; `.cargo/config.toml` sets
 bindgen-generates against `$NCNN_DIR/include/ncnn` and links `libncnn`;
 `.cargo/config.toml` sets `NCNN_DIR=/usr`). GPU inference needs `libncnn`
 built with Vulkan plus a Vulkan driver/ICD for the GPU (ncnn falls back to
-CPU if none is present). Also v4l2 and PAM headers. `openvino`
+CPU if none is present). Also v4l2 and PAM headers. The locker additionally
+needs `wayland-client` and a compositor with `ext-session-lock-v1` (Hyprland
+has it). `openvino`
 is only needed when opting into the `openvino` cargo feature (the `openvino`
 crate links `libopenvino_c`; a default build has zero OpenVINO dependency),
 plus `openvino-intel-npu-plugin` + `intel-npu-driver` for NPU on that build.
@@ -167,3 +181,5 @@ Run it (plus `cargo test --workspace`) after any change to
 - Enrollments: `/etc/redface/models/<user>.face`; models: `/usr/share/redface/`.
 - Socket `/var/run/redface.sock`, pidfile `/var/run/redface.pid`,
   systemd unit `data/redfaced.service`.
+- Locker: config `~/.config/redface/lock.json` (per-user, no install step), PAM
+  service `/etc/pam.d/redface-lock` (installed from `data/redface-lock.pam`).

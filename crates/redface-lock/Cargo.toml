@@ -1,0 +1,25 @@
+[package]
+name = "redface-lock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+redface-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+smithay-client-toolkit = "0.21"
+wayland-client = "0.31"
+tiny-skia = "0.12"
+ab_glyph = "0.2"
+fontdb = "0.23"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[[bin]]
+name = "redface-lock"
+path = "src/main.rs"
+
+[features]
+default = ["ncnn"]
+ncnn = ["redface-runtime/ncnn"]
+openvino = ["redface-runtime/openvino"]

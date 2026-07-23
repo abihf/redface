@@ -19,7 +19,7 @@ endif
 # BUILD
 #----------------------------------------------------------------------------------------
 
-RUSTFILES = Cargo.toml Cargo.lock $(wildcard crates/**/*.rs) $(wildcard crates/**/Cargo.toml)
+RUSTFILES = Cargo.toml Cargo.lock $(shell find crates -name '*.rs' -o -name 'Cargo.toml')
 
 MODELS = data/det_10g.onnx data/w600k_r50.onnx
 NCNN_MODELS = data/det_10g.param data/det_10g.bin data/w600k_r50.param data/w600k_r50.bin
@@ -44,12 +44,13 @@ convert-models:
 	cd data && pipx run pnnx w600k_r50.onnx 'inputshape=[1,3,112,112]' fp16=0 ncnnparam=w600k_r50.param ncnnbin=w600k_r50.bin
 	rm -f data/*.pnnx.* data/*.pnnxsim.onnx data/*_pnnx.py data/*_ncnn.py
 
-build: pam daemon check record
+build: pam daemon check record lock
 
 daemon: $(TARGET_DIR)/redfaced
 pam: $(TARGET_DIR)/libpam_redface.so
 check: $(TARGET_DIR)/redface-check
 record: $(TARGET_DIR)/redface-record
+lock: $(TARGET_DIR)/redface-lock
 
 $(TARGET_DIR)/libpam_redface.so: $(RUSTFILES)
 	cargo build --release -p pam-redface $(OPENVINO_ARGS)
@@ -63,11 +64,16 @@ $(TARGET_DIR)/redface-check: $(RUSTFILES)
 $(TARGET_DIR)/redface-record: $(RUSTFILES)
 	cargo build --release -p redface-record --bin redface-record $(OPENVINO_ARGS)
 
+# The locker does no inference itself (it talks to redfaced over the socket),
+# so it is not gated by OPENVINO_ARGS.
+$(TARGET_DIR)/redface-lock: $(RUSTFILES)
+	cargo build --release -p redface-lock
+
 #----------------------------------------------------------------------------------------
 # INSTALL
 #----------------------------------------------------------------------------------------
 
-install: install-pam install-daemon install-check install-record install-data 
+install: install-pam install-daemon install-check install-record install-lock install-data 
 
 install-pam: pam
 	install $(TARGET_DIR)/libpam_redface.so $(DESTDIR)$(PAMDIR)/pam_redface.so
@@ -83,6 +89,10 @@ install-check: check
 
 install-record: record
 	install $(TARGET_DIR)/redface-record $(DESTDIR)$(BINDIR)/redface-record
+
+install-lock: lock
+	install $(TARGET_DIR)/redface-lock $(DESTDIR)$(BINDIR)/redface-lock
+	install -m 644 data/redface-lock.pam $(DESTDIR)/etc/pam.d/redface-lock
 
 # Installs both formats: .param/.bin for the default ncnn backend, .onnx for
 # opt-in openvino builds.
@@ -102,3 +112,4 @@ clean:
 	rm -f $(TARGET_DIR)/redfaced
 	rm -f $(TARGET_DIR)/redface-check
 	rm -f $(TARGET_DIR)/redface-record
+	rm -f $(TARGET_DIR)/redface-lock
