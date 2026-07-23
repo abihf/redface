@@ -2,6 +2,10 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+	Arc,
+	atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use redface_capture::{Camera, CaptureError, StreamAction};
@@ -116,6 +120,7 @@ pub struct Req {
 pub struct AuthReq {
 	pub client: String,
 	pub user: String,
+	pub timeout: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,17 +163,21 @@ pub fn to_auth_req(req: &Req) -> AuthReq {
 	AuthReq {
 		client: req.params.get("client").cloned().unwrap_or_default(),
 		user: req.params.get("user").cloned().unwrap_or_default(),
+		timeout: req.params.get("timeout").and_then(|s| s.parse().ok()),
 	}
 }
 
-pub fn write_auth_req(mut writer: impl Write, user: &str, client: &str) -> serde_json::Result<()> {
-	let req = Req {
+pub fn write_auth_req(mut writer: impl Write, auth: &AuthReq) -> serde_json::Result<()> {
+	let mut req = Req {
 		action: Action::Authenticate,
 		params: std::collections::BTreeMap::from([
-			("client".to_owned(), client.to_owned()),
-			("user".to_owned(), user.to_owned()),
+			("client".to_owned(), auth.client.to_owned()),
+			("user".to_owned(), auth.user.to_owned()),
 		]),
 	};
+	if let Some(timeout) = auth.timeout {
+		req.params.insert("timeout".to_owned(), timeout.to_string());
+	}
 	serde_json::to_writer(&mut writer, &req)?;
 	writer.write_all(b"\n").map_err(serde_json::Error::io)
 }
@@ -196,12 +205,15 @@ pub fn write_error_res(mut writer: impl Write, err: &dyn std::error::Error) -> s
 	writer.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct VerifyOptions {
 	pub device: PathBuf,
 	pub face_file: PathBuf,
-	pub timeout: Duration,
+	pub timeout: Option<Duration>,
 	pub threshold: f64,
+	/// When set and flagged, the capture loop stops at the next frame (e.g.
+	/// the daemon sets this when the client disconnects mid-verification).
+	pub cancel: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -211,6 +223,7 @@ pub enum VerifyError {
 	Capture(CaptureError),
 	Recognition(RecognizerError),
 	Timeout(Duration),
+	Cancelled,
 }
 
 impl fmt::Display for VerifyError {
@@ -221,6 +234,7 @@ impl fmt::Display for VerifyError {
 			Self::Capture(source) => source.fmt(f),
 			Self::Recognition(source) => source.fmt(f),
 			Self::Timeout(duration) => write!(f, "timeout {duration:?}"),
+			Self::Cancelled => write!(f, "cancelled"),
 		}
 	}
 }
@@ -233,12 +247,20 @@ pub fn verify(recognizer: &mut Recognizer, options: &VerifyOptions) -> Result<bo
 	let started = Instant::now();
 	let mut matched = false;
 	let mut timed_out = false;
+	let mut cancelled = false;
 	let mut fatal_error = None;
 	let mut no_face_frames = 0usize;
 
 	camera
 		.stream(|frame| {
-			if options.timeout > Duration::ZERO && started.elapsed() >= options.timeout {
+			if options.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+				cancelled = true;
+				return StreamAction::Stop;
+			}
+			if let Some(timeout) = options.timeout
+				&& timeout > Duration::ZERO
+				&& started.elapsed() >= timeout
+			{
 				timed_out = true;
 				return StreamAction::Stop;
 			}
@@ -282,8 +304,11 @@ pub fn verify(recognizer: &mut Recognizer, options: &VerifyOptions) -> Result<bo
 	if let Some(err) = fatal_error {
 		return Err(err);
 	}
+	if cancelled {
+		return Err(VerifyError::Cancelled);
+	}
 	if timed_out {
-		return Err(VerifyError::Timeout(options.timeout));
+		return Err(VerifyError::Timeout(options.timeout.unwrap_or_default()));
 	}
 	if no_face_frames > 0 {
 		println!("> Frames without face found: {}\n", no_face_frames);
@@ -346,14 +371,23 @@ mod tests {
 	#[test]
 	fn protocol_round_trip() {
 		let mut buf = Vec::new();
-		write_auth_req(&mut buf, "1000", "check").expect("write request");
+		write_auth_req(
+			&mut buf,
+			&AuthReq {
+				client: "check".into(),
+				user: "1000".into(),
+				timeout: None,
+			},
+		)
+		.expect("write request");
 		let req = read_req(Cursor::new(&buf)).expect("read request");
 
 		assert_eq!(
 			to_auth_req(&req),
 			AuthReq {
 				client: "check".into(),
-				user: "1000".into()
+				user: "1000".into(),
+				timeout: None,
 			}
 		);
 	}

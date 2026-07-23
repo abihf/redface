@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -71,14 +71,29 @@ fn handle_connection(
 			let auth_req = to_auth_req(&req);
 			println!("Authorizing {}", auth_req.user);
 
+			// Watch the socket: the client closing the connection mid-verify
+			// (timeout, Ctrl-C) must stop the camera stream immediately.
+			let disconnected = watch_disconnect(conn)?;
+
+			let timeout = if let Some(timeout) = auth_req.timeout {
+				if timeout <= 0 {
+					None
+				} else {
+					Some(Duration::from_secs(timeout as u64))
+				}
+			} else {
+				Some(Duration::from_secs(config.timeout))
+			};
+
 			let model_file = Path::new(DEFAULT_MODELS_DIR).join(format!("{}.face", auth_req.user));
 			let success = verify(
 				recognizer,
 				&VerifyOptions {
 					device: PathBuf::from(&config.device),
 					face_file: model_file,
-					timeout: Duration::from_secs(config.timeout),
+					timeout,
 					threshold: config.threshold,
+					cancel: Some(disconnected),
 				},
 			);
 
@@ -88,11 +103,32 @@ fn handle_connection(
 					let err = io::Error::other("face not recognized");
 					write_error_res(&mut *conn, &err)?;
 				}
+				Err(redface_runtime::VerifyError::Cancelled) => println!("Client disconnected"),
 				Err(err) => write_error_res(&mut *conn, &err)?,
 			}
 		}
 	};
 	Ok(())
+}
+
+/// Spawns a thread that flags the returned bool once the client is gone.
+/// Bytes in flight (e.g. the trailing newline serde_json leaves after the
+/// request) are drained; only EOF (peer closed) or an error flags the watch.
+fn watch_disconnect(conn: &UnixStream) -> io::Result<Arc<AtomicBool>> {
+	let disconnected = Arc::new(AtomicBool::new(false));
+	let mut watcher = conn.try_clone()?;
+	let watcher_flag = disconnected.clone();
+	thread::spawn(move || {
+		let mut buf = [0u8; 64];
+		loop {
+			match watcher.read(&mut buf) {
+				Ok(0) | Err(_) => break,
+				Ok(_) => {}
+			}
+		}
+		watcher_flag.store(true, Ordering::Relaxed);
+	});
+	Ok(disconnected)
 }
 
 fn is_already_running(path: &str) -> bool {
@@ -124,5 +160,42 @@ impl PidFileGuard {
 impl Drop for PidFileGuard {
 	fn drop(&mut self) {
 		let _ = fs::remove_file(&self.path);
+	}
+}
+
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use redface_runtime::{AuthReq, write_auth_req};
+
+	#[test]
+	fn watcher_ignores_trailing_newline_but_flags_peer_close() {
+		let (mut client, server) = UnixStream::pair().expect("socket pair");
+		write_auth_req(
+			&mut client,
+			&AuthReq {
+				client: "test".into(),
+				user: "1000".into(),
+				timeout: None,
+			},
+		)
+		.expect("write request");
+		read_req(&server).expect("read request");
+
+		let disconnected = watch_disconnect(&server).expect("spawn watcher");
+		// The newline write_auth_req appends after the JSON is still buffered
+		// in the socket; draining it must not count as a disconnect.
+		thread::sleep(Duration::from_millis(100));
+		assert!(!disconnected.load(Ordering::Relaxed));
+
+		drop(client);
+		for _ in 0..100 {
+			if disconnected.load(Ordering::Relaxed) {
+				return;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+		panic!("watcher did not flag the closed connection");
 	}
 }

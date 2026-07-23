@@ -14,7 +14,9 @@ mod simd;
 #[cfg(not(any(feature = "ncnn", feature = "openvino")))]
 compile_error!("no inference backend: enable the `ncnn` (default) or `openvino` feature");
 #[cfg(all(feature = "ncnn", feature = "openvino"))]
-compile_error!("features `ncnn` and `openvino` are mutually exclusive; for OpenVINO build with --no-default-features --features openvino");
+compile_error!(
+	"features `ncnn` and `openvino` are mutually exclusive; for OpenVINO build with --no-default-features --features openvino"
+);
 
 // Model files distributed in the InsightFace `buffalo_l` pack:
 // https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
@@ -526,8 +528,10 @@ fn build_ncnn_runner(path: &Path, detector: bool, device: DevicePref) -> Result<
 	// pipelines during load_param: Vulkan GPU for Npu/Auto (ncnn falls back to
 	// CPU automatically when no Vulkan device is present), CPU for Cpu.
 	net.set_use_vulkan_compute(!matches!(device, DevicePref::Cpu));
-	net.load_param(utf8(&param_path)?).map_err(|err| model_error(err.to_string()))?;
-	net.load_model(utf8(&bin_path)?).map_err(|err| model_error(err.to_string()))?;
+	net.load_param(utf8(&param_path)?)
+		.map_err(|err| model_error(err.to_string()))?;
+	net.load_model(utf8(&bin_path)?)
+		.map_err(|err| model_error(err.to_string()))?;
 
 	let (input_name, output_names) = parse_ncnn_param(&param_path)?;
 	if detector && output_names.len() != 9 {

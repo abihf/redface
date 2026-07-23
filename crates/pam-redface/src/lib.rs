@@ -70,7 +70,16 @@ fn authenticate(pamh: &mut PamHandle, args: Vec<&CStr>) -> PamResultCode {
 		.filter(|value| !value.is_empty())
 		.unwrap_or("pam");
 
-	if write_auth_req(&mut conn, &user.uid().to_string(), client).is_err() {
+	if write_auth_req(
+		&mut conn,
+		&redface_runtime::AuthReq {
+			client: client.into(),
+			user: user.uid().to_string(),
+			timeout: None,
+		},
+	)
+	.is_err()
+	{
 		let _ = send_message(pamh, "Daemon error", true);
 		return PamResultCode::PAM_CRED_UNAVAIL;
 	}
