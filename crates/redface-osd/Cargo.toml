@@ -1,0 +1,12 @@
+[package]
+name = "redface-osd"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "redface-osd"
+path = "src/main.rs"
+
+[dependencies]
+redface-toolkit = { path = "../redface-toolkit" }
+

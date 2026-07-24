@@ -1,7 +1,5 @@
 mod auth;
 mod config;
-mod gpu;
-mod scene;
 mod ui;
 mod wayland;
 
@@ -11,8 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let test = std::env::args().any(|arg| arg == "--test");
 	let config = LockConfig::load_default()?;
 	let background = config.background_image.as_deref().map(load_background).transpose()?;
-	let fonts = ui::Fonts::load()?;
-	wayland::run(config, background, fonts, test)
+	wayland::run(config, background, test)
 }
 
 /// Decodes the configured background image to straight (non-premultiplied)

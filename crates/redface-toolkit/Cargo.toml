@@ -1,0 +1,18 @@
+[package]
+name = "redface-toolkit"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["dylib", "rlib"]
+
+[dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
+smithay-client-toolkit = "0.21"
+wayland-client = { version = "0.31", features = ["system"] }
+raw-window-handle = "0.6"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+ab_glyph = "0.2"
+fontdb = "0.23"
+libc = "0.2"

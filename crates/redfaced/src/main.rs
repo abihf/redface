@@ -163,7 +163,6 @@ impl Drop for PidFileGuard {
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
 	use super::*;

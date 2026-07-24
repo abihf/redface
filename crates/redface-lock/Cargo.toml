@@ -5,18 +5,11 @@ edition = "2024"
 
 [dependencies]
 redface-runtime = { workspace = true }
+redface-toolkit = { path = "../redface-toolkit" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
-smithay-client-toolkit = "0.21"
-wayland-client = { version = "0.31", features = ["system"] }
-ab_glyph = "0.2"
-fontdb = "0.23"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
-raw-window-handle = "0.6"
-pollster = "1"
-bytemuck = { version = "1", features = ["derive"] }
 
 [[bin]]
 name = "redface-lock"

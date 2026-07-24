@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/redface-core", "crates/redface-recognition", "crates/ncnn", "crates/ncnn-bind", "crates/redface-record", "crates/redface-capture", "crates/redface-runtime", "crates/redfaced", "crates/redface-check", "crates/redface-lock", "crates/pam-redface"]
+members = ["crates/redface-core", "crates/redface-recognition", "crates/ncnn", "crates/ncnn-bind", "crates/redface-record", "crates/redface-capture", "crates/redface-runtime", "crates/redfaced", "crates/redface-check", "crates/redface-toolkit", "crates/redface-lock", "crates/redface-osd", "crates/pam-redface"]
 resolver = "3"
 
 [workspace.dependencies]

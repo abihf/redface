@@ -1,7 +1,6 @@
-//! Vulkan renderer for the lock screen. Mirrors the CPU renderer in `ui.rs`
-//! visually: same layout inputs come in as a `Scene` plus `Uniforms`, and all
-//! animations (dot pop, shake, face crossfade, pulse ring) run in the shape
-//! vertex shader off `Uniforms::time`.
+//! Vulkan renderer shared by redface apps. Layout inputs come in as a `Scene`
+//! plus `Uniforms`; all animations run in the shape vertex shader off
+//! `Uniforms::time`.
 
 use std::borrow::Cow;
 use std::ffi::c_void;
@@ -433,7 +432,13 @@ impl Gpu {
 			height: height.max(1),
 			present_mode: wgpu::PresentMode::Fifo,
 			desired_maximum_frame_latency: 2,
-			alpha_mode: caps.alpha_modes[0],
+			// Premultiplied alpha is required for transparent rounded layer
+			// surfaces; fall back to whatever the surface advertises first.
+			alpha_mode: if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+				wgpu::CompositeAlphaMode::PreMultiplied
+			} else {
+				caps.alpha_modes[0]
+			},
 			view_formats: vec![],
 		};
 		gpu_surface.configure(&self.device, &config);

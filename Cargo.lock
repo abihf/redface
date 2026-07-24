@@ -1231,19 +1231,19 @@ version = "0.1.0"
 name = "redface-lock"
 version = "0.1.0"
 dependencies = [
- "ab_glyph",
- "bytemuck",
- "fontdb",
  "image",
  "libc",
- "pollster",
- "raw-window-handle",
  "redface-runtime",
+ "redface-toolkit",
  "serde",
  "serde_json",
- "smithay-client-toolkit",
- "wayland-client",
- "wgpu",
+]
+
+[[package]]
+name = "redface-osd"
+version = "0.1.0"
+dependencies = [
+ "redface-toolkit",
 ]
 
 [[package]]
@@ -1274,6 +1274,21 @@ dependencies = [
  "redface-recognition",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "redface-toolkit"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "bytemuck",
+ "fontdb",
+ "libc",
+ "pollster",
+ "raw-window-handle",
+ "smithay-client-toolkit",
+ "wayland-client",
+ "wgpu",
 ]
 
 [[package]]

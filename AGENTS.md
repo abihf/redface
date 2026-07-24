@@ -30,13 +30,33 @@ built — do not treat it as live code).
   parse current glibc headers). Linked via `NCNN_DIR` (default `/usr`).
 - `crates/redface-runtime` — config (`/etc/redface/config.json`), the unix-socket
   protocol, and the `verify()` loop shared by daemon and tools.
+- `crates/redface-toolkit` — shared Wayland/Vulkan UI toolkit, built as a dylib
+  (`libredface_toolkit.so`, `crate-type = ["dylib", "rlib"]`): wraps wgpu (Vulkan
+  renderer; WGSL shaders in `shaders/`, loaded via `include_str!`) and
+  smithay-client-toolkit (ext-session-lock-v1 and wlr-layer-shell event loop)
+  behind a small app-facing API (implement the `App` trait, call `run()` with a
+  `Role`). Also owns the scene data types (`scene.rs`) and text rasterization
+  with ab_glyph/fontdb into a glyph atlas (`text.rs`). Vulkan is a hard
+  requirement — there is no CPU fallback, so a working Vulkan driver/ICD is
+  needed at runtime. The `rlib` keeps plain `cargo build`/`cargo test` working
+  (static link); release binaries link the .so via the Makefile's
+  `DYNAMIC_ARGS` (`-C prefer-dynamic`, which requires LTO off and an rpath
+  covering `$ORIGIN` and `/usr/lib`). The toolkit/lock/osd release artifacts
+  must be built in ONE cargo invocation (single Makefile rule): dynamically
+  linked binaries record the toolkit's metadata hash in their undefined
+  symbols, and separate per-package builds can produce a .so with a different
+  hash — that mismatch is a runtime "symbol lookup error".
+- `crates/redface-osd` — layer-shell feedback window (via redface-toolkit);
+  for now an animated face indicator with a cancel action.
 - `crates/redface-record` — enrollment CLI (`redface-record`), writes `.face` files.
 - `crates/redface-check` — CLI client that asks the daemon to authenticate.
 - `crates/redface-lock` — Wayland session locker (`ext-session-lock-v1`, works on
-  Hyprland). Rendered with wgpu on Vulkan (smithay-client-toolkit for the
-  Wayland side; WGSL shaders in `shaders/`, loaded via `include_str!`); Vulkan
-  is a hard requirement — there is no CPU fallback, so a working Vulkan
-  driver/ICD is needed at runtime. Animations are evaluated in shaders from
+  Hyprland). Only the lock-specific parts live here: the PAM/face auth state
+  machine (`src/auth.rs`, `src/wayland.rs` as a thin redface-toolkit `App`) and
+  the UI layout/scene builder (`src/ui.rs`); rendering and the Wayland event
+  loop come from redface-toolkit, which the binary links as
+  `libredface_toolkit.so` (`make install-lock` installs it to `$(LIBDIR)`,
+  `/usr/lib` by default). Animations are evaluated in shaders from
   time uniforms; text is rasterized with ab_glyph into a glyph atlas. Passwords
   go through the `redface-lock` PAM service
   (minimal client-side FFI in `src/auth.rs`; pam-client/pam-sys bindgen against
@@ -60,7 +80,7 @@ built — do not treat it as live code).
 
 ```sh
 cargo build --workspace          # debug (ncnn Vulkan GPU backend, no OpenVINO)
-make build                       # release binaries (pam, daemon, check, record, lock)
+make build                       # release binaries (pam, daemon, check, record, lock, osd) + libredface_toolkit.so
 cargo test --workspace           # full test suite
 make fetch-data                  # download ONNX models into data/
 make convert-models              # convert to ncnn .param/.bin via pnnx (smoke test)

@@ -44,13 +44,15 @@ convert-models:
 	cd data && pipx run pnnx w600k_r50.onnx 'inputshape=[1,3,112,112]' fp16=0 ncnnparam=w600k_r50.param ncnnbin=w600k_r50.bin
 	rm -f data/*.pnnx.* data/*.pnnxsim.onnx data/*_pnnx.py data/*_ncnn.py
 
-build: pam daemon check record lock
+build: pam daemon check record lock osd
 
 daemon: $(TARGET_DIR)/redfaced
 pam: $(TARGET_DIR)/libpam_redface.so
 check: $(TARGET_DIR)/redface-check
 record: $(TARGET_DIR)/redface-record
-lock: $(TARGET_DIR)/redface-lock
+toolkit: $(TARGET_DIR)/libredface_toolkit.so
+lock: $(TARGET_DIR)/libredface_toolkit.so $(TARGET_DIR)/redface-lock
+osd: $(TARGET_DIR)/libredface_toolkit.so $(TARGET_DIR)/redface-osd
 
 $(TARGET_DIR)/libpam_redface.so: $(RUSTFILES)
 	cargo build --release -p pam-redface $(OPENVINO_ARGS)
@@ -64,16 +66,27 @@ $(TARGET_DIR)/redface-check: $(RUSTFILES)
 $(TARGET_DIR)/redface-record: $(RUSTFILES)
 	cargo build --release -p redface-record --bin redface-record $(OPENVINO_ARGS)
 
+# The shared Wayland/Vulkan UI toolkit is a dylib; the locker and the OSD link
+# it dynamically. prefer-dynamic picks the .so over the rlib, LTO must be off
+# (incompatible with prefer-dynamic), and the rpath covers both the target dir
+# ($$ORIGIN) and the installed location (/usr/lib).
+DYNAMIC_ARGS = -C prefer-dynamic -C link-args=-Wl,-rpath,/usr/lib,-rpath,\$$ORIGIN
+DYNAMIC_CONFIG = --config profile.release.lto=false
+
+# against it, so it must be built (and installed) alongside them.
 # The locker does no inference itself (it talks to redfaced over the socket),
-# so it is not gated by OPENVINO_ARGS.
-$(TARGET_DIR)/redface-lock: $(RUSTFILES)
-	cargo build --release -p redface-lock
+# so it is not gated by OPENVINO_ARGS. All three artifacts must come from ONE
+# cargo invocation: dynamically linked binaries record the toolkit's metadata
+# hash in their undefined symbols, and per-package builds can produce a .so
+# with a different hash (runtime "symbol lookup error").
+$(TARGET_DIR)/libredface_toolkit.so $(TARGET_DIR)/redface-lock $(TARGET_DIR)/redface-osd: $(RUSTFILES)
+	RUSTFLAGS="$(DYNAMIC_ARGS)" cargo build --release -p redface-toolkit -p redface-lock -p redface-osd $(DYNAMIC_CONFIG)
 
 #----------------------------------------------------------------------------------------
 # INSTALL
 #----------------------------------------------------------------------------------------
 
-install: install-pam install-daemon install-check install-record install-lock install-data 
+install: install-pam install-daemon install-check install-record install-ui install-data
 
 install-pam: pam
 	install $(TARGET_DIR)/libpam_redface.so $(DESTDIR)$(PAMDIR)/pam_redface.so
@@ -90,9 +103,17 @@ install-check: check
 install-record: record
 	install $(TARGET_DIR)/redface-record $(DESTDIR)$(BINDIR)/redface-record
 
+install-ui: install-toolkit install-lock install-osd
+
+install-toolkit: toolkit
+	install $(TARGET_DIR)/libredface_toolkit.so $(DESTDIR)$(LIBDIR)/libredface_toolkit.so
+
 install-lock: lock
 	install $(TARGET_DIR)/redface-lock $(DESTDIR)$(BINDIR)/redface-lock
 	install -m 644 data/redface-lock.pam $(DESTDIR)/etc/pam.d/redface-lock
+
+install-osd: osd
+	install $(TARGET_DIR)/redface-osd $(DESTDIR)$(BINDIR)/redface-osd
 
 # Installs both formats: .param/.bin for the default ncnn backend, .onnx for
 # opt-in openvino builds.
@@ -113,3 +134,5 @@ clean:
 	rm -f $(TARGET_DIR)/redface-check
 	rm -f $(TARGET_DIR)/redface-record
 	rm -f $(TARGET_DIR)/redface-lock
+	rm -f $(TARGET_DIR)/redface-osd
+	rm -f $(TARGET_DIR)/libredface_toolkit.so
