@@ -65,6 +65,13 @@ impl LockApp {
 		}
 	}
 
+	fn stop_face(&mut self) {
+		if let Some(face) = self.face.take() {
+			face.stop();
+			self.ui.set_face_active(false);
+		}
+	}
+
 	fn submit(&mut self) {
 		if self.ui.is_empty() {
 			self.toggle_face();
@@ -157,6 +164,7 @@ impl App for LockApp {
 		} else if event.keysym == Keysym::Return || event.keysym == Keysym::KP_Enter {
 			self.submit();
 		} else if let Some(utf8) = &event.utf8 {
+			self.stop_face();
 			for c in utf8.chars() {
 				if !c.is_control() {
 					self.ui.push_char(c);
