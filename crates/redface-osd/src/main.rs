@@ -41,6 +41,8 @@ struct OsdApp {
 	face_color: [f32; 4],
 	/// Epoch of the Wayland connection (set via first `uniforms` call).
 	epoch: Instant,
+	/// Set by `on_tick` / `apply_notification` when the scene needs a rebuild.
+	needs_redraw: bool,
 }
 
 impl OsdApp {
@@ -53,6 +55,7 @@ impl OsdApp {
 			hover_cancel: false,
 			face_color: ui::ACCENT_COLOR, // blue = Verifying
 			epoch: Instant::now(),
+			needs_redraw: true,
 		}
 	}
 
@@ -66,6 +69,7 @@ impl OsdApp {
 			OSDNotification::Stopped | OSDNotification::Cancelling => self.face_color,
 		};
 		self.notification = notif;
+		self.needs_redraw = true;
 		// Start the 3-second hide timer as soon as the daemon tells us
 		// the session is over, not only on the subsequent EOF.
 		if matches!(self.notification, OSDNotification::Stopped) && self.stopped_at.is_none() {
@@ -76,6 +80,10 @@ impl OsdApp {
 
 	fn active(&self) -> bool {
 		self.stopped_at.is_none()
+	}
+
+	fn button_label(&self) -> &str {
+		if self.stopped_at.is_some() { "Close" } else { "Cancel" }
 	}
 }
 
@@ -90,7 +98,18 @@ impl App for OsdApp {
 		_epoch: Instant,
 		_primary: bool,
 	) -> Scene {
-		ui::build_scene(self.hover_cancel, self.face_color, fonts, atlas, width, height, scale)
+		let scene = ui::build_scene(
+			self.hover_cancel,
+			self.face_color,
+			self.button_label(),
+			fonts,
+			atlas,
+			width,
+			height,
+			scale,
+		);
+		self.needs_redraw = false;
+		scene
 	}
 
 	fn uniforms(&self, _epoch: Instant) -> Uniforms {
@@ -112,14 +131,16 @@ impl App for OsdApp {
 
 	fn on_key(&mut self, event: &KeyEvent) {
 		if event.keysym == Keysym::Escape {
-			self.send_cancel();
+			if self.stopped_at.is_some() {
+				// Already stopped: Esc dismisses immediately.
+				self.dismiss();
+			} else {
+				self.send_cancel();
+			}
 		}
 	}
 
 	fn on_pointer(&mut self, kind: PointerEventKind, position: (f64, f64)) {
-		if !self.active() {
-			return;
-		}
 		let lay = ui::layout(SURFACE_SIZE.0, SURFACE_SIZE.1, 1.0);
 		match kind {
 			PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
@@ -129,7 +150,11 @@ impl App for OsdApp {
 			PointerEventKind::Press { button, .. }
 				if button == BTN_LEFT && ui::hit_cancel(&lay, position.0, position.1) =>
 			{
-				self.send_cancel();
+				if self.stopped_at.is_some() {
+					self.dismiss();
+				} else {
+					self.send_cancel();
+				}
 			}
 			_ => {}
 		}
@@ -175,11 +200,16 @@ impl App for OsdApp {
 					log::debug!("osd: socket closed ({err}), treating as Stopped");
 					if self.stopped_at.is_none() {
 						self.stopped_at = Some(Instant::now());
+						self.needs_redraw = true;
 					}
 					break;
 				}
 			}
 		}
+	}
+
+	fn tick_dirty(&self) -> bool {
+		self.needs_redraw
 	}
 }
 
@@ -191,6 +221,13 @@ impl OsdApp {
 		log::debug!("osd: user cancelled, sending Cancelling to daemon");
 		self.cancelled_by_user = true;
 		let _ = OSDNotification::Cancelling.write_to(&mut self.osd_conn);
+	}
+
+	/// Set stopped_at far enough in the past that `should_exit` returns
+	/// true on the next check — dismisses the UI immediately.
+	fn dismiss(&mut self) {
+		log::debug!("osd: user dismissed");
+		self.stopped_at = Some(Instant::now() - std::time::Duration::from_secs(4));
 	}
 }
 

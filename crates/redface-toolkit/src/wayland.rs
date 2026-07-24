@@ -101,6 +101,12 @@ pub trait App {
 	/// Called after every event-loop dispatch (poll auth channels etc.).
 	fn on_tick(&mut self) {}
 
+	/// Return true from [`App::on_tick`] handling to request a scene rebuild
+	/// (e.g. state changed from socket I/O). Default returns false.
+	fn tick_dirty(&self) -> bool {
+		false
+	}
+
 	/// Extra fd added to the poll set; [`App::on_tick`] runs when it wakes.
 	fn wake_fd(&self) -> Option<RawFd> {
 		None
@@ -755,6 +761,10 @@ pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
 		if runner.app.should_exit() {
 			runner.exit = true;
 			runner.requested_exit = true;
+		}
+
+		if runner.app.tick_dirty() {
+			runner.request_redraw(&conn, &qh);
 		}
 
 		// Clock text changes once a minute; that is a scene rebuild, not just

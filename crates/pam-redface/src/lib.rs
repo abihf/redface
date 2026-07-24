@@ -74,7 +74,7 @@ fn authenticate(pamh: &mut PamHandle, args: Vec<&CStr>) -> PamResultCode {
 		client: client.into(),
 		user: user.uid().to_string(),
 		timeout: None,
-		show_osd: false,
+		show_osd: true,
 	};
 
 	if req.write_to(&mut conn).is_err() {
@@ -95,6 +95,10 @@ fn authenticate(pamh: &mut PamHandle, args: Vec<&CStr>) -> PamResultCode {
 		DaemonResponse::AuthError(ref error) => {
 			let _ = send_message(pamh, error, true);
 			return PamResultCode::PAM_CRED_ERR;
+		}
+		_ => {
+			let _ = send_message(pamh, "unexpected response", true);
+			return PamResultCode::PAM_CRED_UNAVAIL;
 		}
 	}
 

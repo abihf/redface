@@ -208,6 +208,7 @@ fn push_text(
 pub fn build_scene(
 	hover_cancel: bool,
 	face_color: [f32; 4],
+	button_label: &str,
 	fonts: &Fonts,
 	atlas: &mut GlyphAtlas,
 	width: u32,
@@ -227,7 +228,7 @@ pub fn build_scene(
 		lay.text_size,
 		bx + bw / 2.0,
 		by + bh / 2.0,
-		"Cancel",
+		button_label,
 		TEXT_COLOR,
 	);
 	scene
@@ -336,7 +337,7 @@ mod tests {
 	fn scene_emits_cancel_text_with_shadow() {
 		let Ok(fonts) = Fonts::load() else { return };
 		let mut atlas = GlyphAtlas::new();
-		let scene = build_scene(false, ACCENT_COLOR, &fonts, &mut atlas, 380, 210, 1.0);
+		let scene = build_scene(false, ACCENT_COLOR, "Cancel", &fonts, &mut atlas, 380, 210, 1.0);
 		assert_eq!(scene.shapes.len(), 6);
 		// Shadow + main pass per glyph.
 		assert!(!scene.texts.is_empty());
