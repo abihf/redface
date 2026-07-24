@@ -53,7 +53,7 @@ impl Fonts {
 		let mut db = fontdb::Database::new();
 		db.load_system_fonts();
 		let query = fontdb::Query {
-			families: &[fontdb::Family::SansSerif],
+			families: &[fontdb::Family::Name("Fira Sans")],
 			..Default::default()
 		};
 		let id = db
