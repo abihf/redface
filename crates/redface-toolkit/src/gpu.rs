@@ -553,6 +553,15 @@ impl Drop for Gpu {
 			gl.delete_program(self.bg_program);
 			gl.delete_program(self.shape_program);
 			gl.delete_program(self.text_program);
+			// Unbind before destroying — some Mesa/LLVM versions corrupt
+			// internal shader-compiler state if the context is destroyed
+			// while still current, crashing on the next eglInitialize.
+			eglMakeCurrent(
+				self.egl_display,
+				EGL_NO_SURFACE,
+				EGL_NO_SURFACE,
+				EGL_NO_CONTEXT,
+			);
 			eglDestroySurface(self.egl_display, self.pbuffer);
 			eglDestroyContext(self.egl_display, self.egl_context);
 			eglTerminate(self.egl_display);

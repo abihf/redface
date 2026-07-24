@@ -646,7 +646,9 @@ wayland_client::delegate_noop!(Runner: ignore WpViewport);
 
 /// Runs the event loop until the app exits. GLES is a hard requirement.
 pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
+	log::debug!("tk: run() enter, namespace={}", config.namespace);
 	let conn = Connection::connect_to_env()?;
+	log::debug!("tk: wayland connection created");
 	let (globals, mut event_queue) = registry_queue_init(&conn)?;
 	let qh = event_queue.handle();
 
@@ -695,6 +697,7 @@ pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
 	// Populate the output registry before creating any surfaces.
 	event_queue.roundtrip(&mut runner)?;
 	let outputs: Vec<wl_output::WlOutput> = runner.output_state.outputs().collect();
+	log::debug!("tk: {} output(s) detected", outputs.len());
 	if let Some(lock_state) = &session_lock_state {
 		// The lock object must be kept alive: dropping it destroys the lock
 		// while the session stays locked (Hyprland's lockdead screen).
@@ -709,12 +712,14 @@ pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
 	} else {
 		let all_outputs = runner.layer_config.as_ref().is_some_and(|config| config.all_outputs);
 		for output in &outputs {
+			log::debug!("tk: creating layer surface for output");
 			runner.add_layer_surface(&qh, output);
 			if !all_outputs {
 				break;
 			}
 		}
 	}
+	log::debug!("tk: {} surface(s) created, entering event loop", runner.surfaces.len());
 
 	let wake_fd = runner.app.wake_fd();
 	while !runner.exit {
@@ -760,6 +765,7 @@ pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
 			runner.request_redraw(&conn, &qh);
 		}
 	}
+	log::debug!("tk: event loop exited (requested_exit={})", runner.requested_exit);
 
 	if runner.requested_exit {
 		runner.app.on_exit();
@@ -771,9 +777,20 @@ pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
 			lock.unlock();
 		}
 		runner.session_live = false;
-		event_queue.roundtrip(&mut runner)?;
 	}
+
+	// Destroy every surface explicitly, then roundtrip so the compositor
+	// finishes processing the destruction before we return. Without this a
+	// persistent caller that immediately reconnects (the OSD's accept loop)
+	// can hit "invalid object" protocol errors because the old connection's
+	// objects haven't been fully cleaned up server-side yet.
+	log::debug!("tk: destroying {} surface(s)", runner.surfaces.len());
+	runner.surfaces.clear();
+	log::debug!("tk: roundtrip to sync surface destruction with compositor");
+	event_queue.roundtrip(&mut runner)?;
+	log::debug!("tk: roundtrip done, flushing");
 	conn.flush()?;
+	log::debug!("tk: run() returning Ok");
 	if let Some(err) = runner.gpu_error {
 		return Err(err.into());
 	}

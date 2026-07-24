@@ -9,7 +9,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use redface_capture::{Camera, CaptureError, StreamAction};
-use redface_core::{Descriptor, DescriptorError, read_descriptors};
+use redface_core::{Descriptor, DescriptorError, OSDNotification, read_descriptors};
 use redface_recognition::{Recognizer, RecognizerError};
 
 #[derive(Clone, Debug)]
@@ -21,6 +21,9 @@ pub struct VerifyOptions {
 	/// When set and flagged, the capture loop stops at the next frame (e.g.
 	/// the daemon sets this when the client disconnects mid-verification).
 	pub cancel: Option<Arc<AtomicBool>>,
+	/// When set and flagged, the capture loop stops at the next frame (e.g.
+	/// the daemon sets this when the OSD sends Cancelling).
+	pub osd_cancel: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -48,7 +51,11 @@ impl fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-pub fn verify(recognizer: &mut Recognizer, options: &VerifyOptions) -> Result<bool, VerifyError> {
+pub fn verify(
+	recognizer: &mut Recognizer,
+	options: &VerifyOptions,
+	mut on_event: impl FnMut(OSDNotification),
+) -> Result<bool, VerifyError> {
 	let descriptors = load_descriptors(&options.face_file)?;
 	let camera = Camera::new(&options.device);
 	let started = Instant::now();
@@ -57,10 +64,17 @@ pub fn verify(recognizer: &mut Recognizer, options: &VerifyOptions) -> Result<bo
 	let mut cancelled = false;
 	let mut fatal_error = None;
 	let mut no_face_frames = 0usize;
+	let mut frame_count = 0u64;
+	let mut was_mismatch = false;
 
 	camera
 		.stream(|frame| {
+			frame_count += 1;
 			if options.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+				cancelled = true;
+				return StreamAction::Stop;
+			}
+			if options.osd_cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
 				cancelled = true;
 				return StreamAction::Stop;
 			}
@@ -70,6 +84,11 @@ pub fn verify(recognizer: &mut Recognizer, options: &VerifyOptions) -> Result<bo
 			{
 				timed_out = true;
 				return StreamAction::Stop;
+			}
+
+			// Throttle Verifying to ~2 Hz (every 30 frames at 60 fps).
+			if frame_count % 30 == 0 {
+				on_event(OSDNotification::Verifying);
 			}
 
 			let rec_start = Instant::now();
@@ -86,23 +105,32 @@ pub fn verify(recognizer: &mut Recognizer, options: &VerifyOptions) -> Result<bo
 
 			if faces.is_empty() {
 				no_face_frames += 1;
+				if was_mismatch {
+					was_mismatch = false;
+					on_event(OSDNotification::Verifying);
+				}
 				return StreamAction::Continue;
 			}
 
 			println!("* Found {} faces in {:?}", faces.len(), rec_start.elapsed());
-			for (index, face) in faces.iter().enumerate() {
-				print!("  - Face [{}]:", index);
-				for descriptor in &descriptors {
-					let similarity = descriptor.cosine_similarity(&face.descriptor);
-					print!(" {:.3}", similarity);
-					if similarity > options.threshold {
-						println!(" (found)");
-						matched = true;
-						return StreamAction::Stop;
-					}
+		for (index, face) in faces.iter().enumerate() {
+			print!("  - Face [{}]:", index);
+			for descriptor in &descriptors {
+				let similarity = descriptor.cosine_similarity(&face.descriptor);
+				print!(" {:.3}", similarity);
+				if similarity > options.threshold {
+					println!(" (found)");
+					matched = true;
+					on_event(OSDNotification::Success);
+					return StreamAction::Stop;
 				}
-				println!();
 			}
+			println!();
+		}
+
+		// Faces seen but none matched the enrolled descriptors.
+		was_mismatch = true;
+		on_event(OSDNotification::FaceMismatch);
 
 			StreamAction::Continue
 		})

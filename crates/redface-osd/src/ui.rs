@@ -10,7 +10,9 @@ use redface_toolkit::text::{Fonts, GlyphAtlas};
 // #e6e6e6 / #26262e / #7aa2f7, straight alpha.
 pub const TEXT_COLOR: [f32; 4] = [230.0 / 255.0, 230.0 / 255.0, 230.0 / 255.0, 1.0];
 pub const BOX_COLOR: [f32; 4] = [38.0 / 255.0, 38.0 / 255.0, 46.0 / 255.0, 1.0];
-pub const ACCENT_COLOR: [f32; 4] = [122.0 / 255.0, 162.0 / 255.0, 247.0 / 255.0, 1.0];
+pub const ACCENT_COLOR: [f32; 4] = [122.0 / 255.0, 162.0 / 255.0, 247.0 / 255.0, 1.0]; // blue
+pub const SUCCESS_COLOR: [f32; 4] = [158.0 / 255.0, 206.0 / 255.0, 106.0 / 255.0, 1.0]; // green
+pub const MISMATCH_COLOR: [f32; 4] = [247.0 / 255.0, 118.0 / 255.0, 142.0 / 255.0, 1.0]; // red
 
 const PANEL_COLOR: [f32; 4] = [0.06, 0.06, 0.08, 0.85];
 
@@ -60,7 +62,13 @@ fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
 
 /// Shapes for one frame: translucent panel, pulsing face glyph, cancel
 /// button. Kept font-free so it is testable without a system font.
-pub fn build_shapes(lay: &Layout, hover_cancel: bool, width: u32, height: u32) -> Vec<ShapeInstance> {
+pub fn build_shapes(
+	lay: &Layout,
+	hover_cancel: bool,
+	face_color: [f32; 4],
+	width: u32,
+	height: u32,
+) -> Vec<ShapeInstance> {
 	let (w, h) = (width as f32, height as f32);
 	let (fx, fy) = lay.face_center;
 	let fr = lay.face_radius;
@@ -79,19 +87,21 @@ pub fn build_shapes(lay: &Layout, hover_cancel: bool, width: u32, height: u32) -
 	});
 
 	// Pulse ring: the shader animates alpha/radius while face_active is 1.
+	// The ring colour follows the current notification state.
 	let ring_radius = fr + 6.0 * lay.scale;
 	shapes.push(ShapeInstance {
 		center: [fx, fy],
 		half_size: [ring_radius, ring_radius],
-		color: [ACCENT_COLOR[0], ACCENT_COLOR[1], ACCENT_COLOR[2], 0.45],
+		color: [face_color[0], face_color[1], face_color[2], 0.45],
 		radius: ring_radius,
 		inner_radius: (ring_radius - 3.0 * lay.scale).max(0.0),
 		birth_time: -1.0,
 		kind: SHAPE_PULSE_RING,
 	});
 
-	// Face glyph: hollow head circle plus two eyes.
-	let glyph_color = [TEXT_COLOR[0], TEXT_COLOR[1], TEXT_COLOR[2], 0.9];
+	// Face glyph: hollow head circle plus two eyes, tinted with face_color.
+	let glyph_alpha = 0.9;
+	let glyph_color = [face_color[0], face_color[1], face_color[2], glyph_alpha];
 	let scale = lay.scale;
 	let head_radius = fr * 0.42;
 	shapes.push(ShapeInstance {
@@ -197,6 +207,7 @@ fn push_text(
 /// runs in the shader, so positions here are always the rest positions.
 pub fn build_scene(
 	hover_cancel: bool,
+	face_color: [f32; 4],
 	fonts: &Fonts,
 	atlas: &mut GlyphAtlas,
 	width: u32,
@@ -205,7 +216,7 @@ pub fn build_scene(
 ) -> Scene {
 	let lay = layout(width, height, scale);
 	let mut scene = Scene {
-		shapes: build_shapes(&lay, hover_cancel, width, height),
+		shapes: build_shapes(&lay, hover_cancel, face_color, width, height),
 		texts: Vec::new(),
 	};
 	let (bx, by, bw, bh) = lay.cancel_button;
@@ -262,7 +273,7 @@ mod tests {
 	#[test]
 	fn shapes_count_and_kinds() {
 		let lay = layout(380, 210, 1.0);
-		let shapes = build_shapes(&lay, false, 380, 210);
+		let shapes = build_shapes(&lay, false, ACCENT_COLOR, 380, 210);
 		// Panel + pulse ring + head + 2 eyes + button.
 		assert_eq!(shapes.len(), 6);
 		assert_eq!(shapes.iter().filter(|s| s.kind == SHAPE_PULSE_RING).count(), 1);
@@ -272,7 +283,7 @@ mod tests {
 	#[test]
 	fn panel_is_translucent_and_rounded() {
 		let lay = layout(380, 210, 1.0);
-		let shapes = build_shapes(&lay, false, 380, 210);
+		let shapes = build_shapes(&lay, false, ACCENT_COLOR, 380, 210);
 		let panel = &shapes[0];
 		assert_eq!(panel.kind, 0);
 		assert_eq!(panel.center, [190.0, 105.0]);
@@ -285,7 +296,7 @@ mod tests {
 	#[test]
 	fn face_glyph_head_is_hollow() {
 		let lay = layout(380, 210, 1.0);
-		let shapes = build_shapes(&lay, false, 380, 210);
+		let shapes = build_shapes(&lay, false, ACCENT_COLOR, 380, 210);
 		let head = shapes
 			.iter()
 			.find(|s| s.kind == SHAPE_FACE_GLYPH && s.inner_radius > 0.0)
@@ -303,8 +314,8 @@ mod tests {
 	#[test]
 	fn hover_tints_button_toward_accent() {
 		let lay = layout(380, 210, 1.0);
-		let plain = build_shapes(&lay, false, 380, 210);
-		let hovered = build_shapes(&lay, true, 380, 210);
+		let plain = build_shapes(&lay, false, ACCENT_COLOR, 380, 210);
+		let hovered = build_shapes(&lay, true, ACCENT_COLOR, 380, 210);
 		let button = plain.last().unwrap().color;
 		let hover = hovered.last().unwrap().color;
 		assert_eq!(button[..3], BOX_COLOR[..3]);
@@ -313,10 +324,10 @@ mod tests {
 			let expected = BOX_COLOR[i] + (ACCENT_COLOR[i] - BOX_COLOR[i]) * 0.35;
 			assert!((hover[i] - expected).abs() < 1e-6);
 		}
-		// Only the button changes on hover.
+		// Only the button changes on hover; the face glyph and ring are
+		// unaffected by hover (their colour is driven by face_color).
 		for (a, b) in plain[..5].iter().zip(&hovered[..5]) {
 			assert_eq!(a.center, b.center);
-			assert_eq!(a.color, b.color);
 			assert_eq!(a.kind, b.kind);
 		}
 	}
@@ -325,7 +336,7 @@ mod tests {
 	fn scene_emits_cancel_text_with_shadow() {
 		let Ok(fonts) = Fonts::load() else { return };
 		let mut atlas = GlyphAtlas::new();
-		let scene = build_scene(false, &fonts, &mut atlas, 380, 210, 1.0);
+		let scene = build_scene(false, ACCENT_COLOR, &fonts, &mut atlas, 380, 210, 1.0);
 		assert_eq!(scene.shapes.len(), 6);
 		// Shadow + main pass per glyph.
 		assert!(!scene.texts.is_empty());

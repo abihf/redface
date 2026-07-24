@@ -13,13 +13,15 @@ use std::time::Duration;
 
 use redface_core::{
 	prelude::*,
-	Config, DaemonRequest, DaemonResponse, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR, DevicePref,
+	Config, DaemonRequest, DaemonResponse, OSDNotification, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR,
+	DevicePref, get_osd_socket_path,
 };
 use redface_recognition::Recognizer;
 use redface_runtime::{VerifyOptions, verify};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+	env_logger::init();
 	let config = Config::load_default()?;
 	if is_already_running(&config.pid_file) {
 		return Err("already run".into());
@@ -72,7 +74,7 @@ fn handle_connection(
 			client: _client,
 			user,
 			timeout,
-			show_osd: _show_osd,
+			show_osd,
 		} => {
 			println!("Authorizing {user}");
 
@@ -90,7 +92,18 @@ fn handle_connection(
 				Some(Duration::from_secs(config.timeout))
 			};
 
+			// Connect to the per-user OSD socket when the client requested
+			// visual feedback (redface-check sets show_osd = true).
+		log::debug!("daemon: show_osd={show_osd}");
+			let (mut osd_conn, osd_cancelled) = if show_osd {
+				connect_osd(&user)
+			} else {
+				None
+			}.unzip();
+			log::debug!("daemon: osd_conn={}", if osd_conn.is_some() { "connected" } else { "none" });
+
 			let model_file = Path::new(DEFAULT_MODELS_DIR).join(format!("{user}.face"));
+			let mut osd_notify = osd_conn.as_mut().map(|c| c.try_clone()).transpose()?;
 			let success = verify(
 				recognizer,
 				&VerifyOptions {
@@ -99,8 +112,22 @@ fn handle_connection(
 					timeout: timeout_dur,
 					threshold: config.threshold,
 					cancel: Some(disconnected),
+					osd_cancel: osd_cancelled,
+				},
+				|event| {
+					if let Some(ref mut stream) = osd_notify {
+						let _ = event.write_to(&mut *stream);
+					}
 				},
 			);
+
+			// Send Stopped so the OSD knows the session is over.
+			if let Some(ref mut stream) = osd_conn {
+			log::debug!("daemon: sending Stopped to OSD");
+			let _ = OSDNotification::Stopped.write_to(&mut *stream);
+			let _ = stream.shutdown(Shutdown::Both);
+			log::debug!("daemon: OSD connection shut down");
+			}
 
 			match success {
 				Ok(true) => {
@@ -137,6 +164,49 @@ fn watch_disconnect(conn: &UnixStream) -> io::Result<Arc<AtomicBool>> {
 		watcher_flag.store(true, Ordering::Relaxed);
 	});
 	Ok(disconnected)
+}
+
+/// Tries to connect to the per-user OSD socket. Returns the connection and a
+/// cancel flag that the OSD can trip by sending `Cancelling` (or closing the
+/// connection). If the socket doesn't exist or `user` isn't a valid uid the
+/// function returns `None` — verification proceeds without visual feedback.
+fn connect_osd(user: &str) -> Option<(UnixStream, Arc<AtomicBool>)> {
+	let uid: u32 = user.parse().ok()?;
+	let path = get_osd_socket_path(uid);
+	log::debug!("daemon: osd socket path: {}", path.display());
+	if !path.exists() {
+		log::debug!("daemon: osd socket does not exist, skipping");
+		return None;
+	}
+	let mut conn = UnixStream::connect(&path).ok()?;
+	log::debug!("daemon: connected to osd socket");
+	// Let the OSD know we're starting.
+	let _ = OSDNotification::Verifying.write_to(&mut conn);
+	log::debug!("daemon: sent Verifying to osd");
+
+	let cancelled = Arc::new(AtomicBool::new(false));
+	let mut watcher = conn.try_clone().ok()?;
+	let watcher_flag = cancelled.clone();
+	thread::spawn(move || {
+		log::debug!("daemon: osd cancel watcher started");
+		loop {
+			match OSDNotification::read_from(&mut watcher) {
+				Ok(OSDNotification::Cancelling) => {
+					log::debug!("daemon: osd cancel watcher: received Cancelling");
+					watcher_flag.store(true, Ordering::Relaxed);
+					break;
+				}
+				Ok(other) => log::debug!("daemon: osd cancel watcher: ignoring {:?}", other),
+				Err(err) => {
+					log::debug!("daemon: osd cancel watcher: error/EOF ({err}), flagging cancel");
+					watcher_flag.store(true, Ordering::Relaxed);
+					break;
+				}
+			}
+		}
+		log::debug!("daemon: osd cancel watcher exiting");
+	});
+	Some((conn, cancelled))
 }
 
 fn is_already_running(path: &str) -> bool {

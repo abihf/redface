@@ -9,4 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 redface-toolkit = { path = "../redface-toolkit" }
+redface-core = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
 

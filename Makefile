@@ -100,6 +100,10 @@ install-lock: lock
 install-osd: osd
 	install $(TARGET_DIR)/redface-osd $(DESTDIR)$(BINDIR)/redface-osd
 
+install-osd-unit:
+	install -d -m 755 $(DESTDIR)$(LIBDIR)/systemd/user
+	install -m 644 data/redface-osd.service $(DESTDIR)$(LIBDIR)/systemd/user/redface-osd.service
+
 # Installs both formats: .param/.bin for the default ncnn backend, .onnx for
 # opt-in openvino builds.
 install-data:

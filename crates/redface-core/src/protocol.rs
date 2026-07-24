@@ -18,3 +18,13 @@ pub enum DaemonResponse {
 	AuthSuccess,
 	AuthError(String),
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum OSDNotification {
+	Verifying,
+	Success,
+	FaceMismatch,
+	Cancelling,
+	Stopped,
+}

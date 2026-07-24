@@ -1,0 +1,28 @@
+# redface-osd — per-user Wayland OSD for face-recognition feedback.
+#
+# Install:   make install-osd-unit
+# Enable:    systemctl --user enable redface-osd.service
+# Disable:   systemctl --user disable redface-osd.service
+#
+# The unit is installed but NOT enabled by default; enable it once per user.
+
+[Unit]
+Description=Redface OSD (face-recognition feedback overlay)
+Documentation=https://github.com/abihf/redface
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/redface-osd
+Restart=on-failure
+RestartSec=2
+
+# Wayland needs the display socket path; defaults to wayland-1.  Override
+# with a drop-in if your compositor uses a different name:
+#   systemctl --user edit redface-osd.service
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target

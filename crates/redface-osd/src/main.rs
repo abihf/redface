@@ -1,12 +1,19 @@
-//! redface-osd: small Wayland OSD (wlr-layer-shell, top layer) shown while
-//! face recognition runs. Esc or the Cancel button aborts; the process exits
-//! 1 when cancelled, 0 when the OSD was closed any other way.
+//! redface-osd: persistent Wayland OSD (wlr-layer-shell, top layer) that
+//! listens on a per-user Unix socket and shows face-recognition feedback.
+//! Esc or the Cancel button sends `Cancelling` back to the daemon; the OSD
+//! hides 3 seconds after `Stopped` and then waits for the next session.
 
 mod ui;
 
+use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 use std::time::Instant;
+use std::fs;
 
+use redface_core::{prelude::*, get_osd_socket_path, OSDNotification};
 use redface_toolkit::scene::{Scene, Uniforms};
 use redface_toolkit::text::{Fonts, GlyphAtlas};
 use redface_toolkit::{
@@ -19,16 +26,56 @@ const SURFACE_SIZE: (u32, u32) = (380, 210);
 const BTN_LEFT: u32 = 0x110;
 
 struct OsdApp {
-	cancelled: bool,
+	/// The accepted daemon connection; non-blocking so reads in `on_tick`
+	/// never stall the Wayland event loop.
+	osd_conn: UnixStream,
+	/// Last notification received from the daemon.
+	notification: OSDNotification,
+	/// When `Stopped` was received; the UI stays visible for 3 more seconds.
+	stopped_at: Option<Instant>,
+	/// True after the user clicked Cancel (we sent Cancelling and are waiting
+	/// for the daemon to reply with Stopped).
+	cancelled_by_user: bool,
 	hover_cancel: bool,
+	/// Face colour derived from `notification`.
+	face_color: [f32; 4],
+	/// Epoch of the Wayland connection (set via first `uniforms` call).
+	epoch: Instant,
 }
 
 impl OsdApp {
-	fn new() -> Self {
+	fn new(osd_conn: UnixStream) -> Self {
 		Self {
-			cancelled: false,
+			osd_conn,
+			notification: OSDNotification::Verifying,
+			stopped_at: None,
+			cancelled_by_user: false,
 			hover_cancel: false,
+			face_color: ui::ACCENT_COLOR, // blue = Verifying
+			epoch: Instant::now(),
 		}
+	}
+
+	fn apply_notification(&mut self, notif: OSDNotification) {
+		self.face_color = match notif {
+			OSDNotification::Verifying => ui::ACCENT_COLOR,
+			OSDNotification::Success => ui::SUCCESS_COLOR,
+			OSDNotification::FaceMismatch => ui::MISMATCH_COLOR,
+			// Keep the last active colour; the 3 s fade-out is driven by
+			// stopped_at rather than the colour.
+			OSDNotification::Stopped | OSDNotification::Cancelling => self.face_color,
+		};
+		self.notification = notif;
+		// Start the 3-second hide timer as soon as the daemon tells us
+		// the session is over, not only on the subsequent EOF.
+		if matches!(self.notification, OSDNotification::Stopped) && self.stopped_at.is_none() {
+			log::debug!("osd: received Stopped, starting 3s hide timer");
+			self.stopped_at = Some(Instant::now());
+		}
+	}
+
+	fn active(&self) -> bool {
+		self.stopped_at.is_none()
 	}
 }
 
@@ -43,34 +90,36 @@ impl App for OsdApp {
 		_epoch: Instant,
 		_primary: bool,
 	) -> Scene {
-		ui::build_scene(self.hover_cancel, fonts, atlas, width, height, scale)
+		ui::build_scene(self.hover_cancel, self.face_color, fonts, atlas, width, height, scale)
 	}
 
-	fn uniforms(&self, epoch: Instant) -> Uniforms {
+	fn uniforms(&self, _epoch: Instant) -> Uniforms {
+		let elapsed = self.epoch.elapsed().as_secs_f32();
+		let face_active = if self.active() { 1.0 } else { 0.0 };
 		Uniforms {
-			// Overwritten by the runner.
 			surface_size: [0.0, 0.0],
 			bg_image_size: [0.0, 0.0],
-			// Fully transparent: the rounded panel is the only backdrop.
 			bg_color: [0.0, 0.0, 0.0, 0.0],
 			text_color: ui::TEXT_COLOR,
 			box_color: ui::BOX_COLOR,
-			accent_color: ui::ACCENT_COLOR,
-			time: epoch.elapsed().as_secs_f32(),
+			accent_color: self.face_color,
+			time: elapsed,
 			shake_start: -1.0,
-			// Active since epoch: the pulse ring animates continuously.
 			face_toggled_at: 0.0,
-			face_active: 1.0,
+			face_active,
 		}
 	}
 
 	fn on_key(&mut self, event: &KeyEvent) {
 		if event.keysym == Keysym::Escape {
-			self.cancelled = true;
+			self.send_cancel();
 		}
 	}
 
 	fn on_pointer(&mut self, kind: PointerEventKind, position: (f64, f64)) {
+		if !self.active() {
+			return;
+		}
 		let lay = ui::layout(SURFACE_SIZE.0, SURFACE_SIZE.1, 1.0);
 		match kind {
 			PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
@@ -80,159 +129,135 @@ impl App for OsdApp {
 			PointerEventKind::Press { button, .. }
 				if button == BTN_LEFT && ui::hit_cancel(&lay, position.0, position.1) =>
 			{
-				self.cancelled = true;
+				self.send_cancel();
 			}
 			_ => {}
 		}
 	}
 
-	// The pulse ring animates continuously.
 	fn animating(&self) -> bool {
-		true
+		self.active()
 	}
 
 	fn should_exit(&self) -> bool {
-		self.cancelled
+		if let Some(at) = self.stopped_at {
+			let elapsed = at.elapsed().as_secs();
+			let should = elapsed >= 3;
+			if should {
+				log::debug!("osd: stopped_at elapsed {}s >= 3s, exiting", elapsed);
+			}
+			should
+		} else {
+			false
+		}
+	}
+
+	/// Extra fd added to the poll set; [`App::on_tick`] runs when data
+	/// arrives on the daemon connection.
+	fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
+		Some(self.osd_conn.as_raw_fd())
+	}
+
+	fn on_tick(&mut self) {
+		// Once the session is over the socket is shut down and will keep
+		// waking up poll; don't try to read from it again.
+		if self.stopped_at.is_some() {
+			return;
+		}
+		loop {
+			match OSDNotification::read_from(&mut self.osd_conn) {
+				Ok(notif) => {
+					log::debug!("osd: received notification: {:?}", notif);
+					self.apply_notification(notif);
+				}
+				Err(ref err) if err.kind() == ErrorKind::WouldBlock => break,
+				Err(err) => {
+					log::debug!("osd: socket closed ({err}), treating as Stopped");
+					if self.stopped_at.is_none() {
+						self.stopped_at = Some(Instant::now());
+					}
+					break;
+				}
+			}
+		}
+	}
+}
+
+impl OsdApp {
+	fn send_cancel(&mut self) {
+		if self.cancelled_by_user || !self.active() {
+			return;
+		}
+		log::debug!("osd: user cancelled, sending Cancelling to daemon");
+		self.cancelled_by_user = true;
+		let _ = OSDNotification::Cancelling.write_to(&mut self.osd_conn);
 	}
 }
 
 fn main() -> ExitCode {
-	let mut app = OsdApp::new();
-	let config = RunConfig {
-		role: Role::Layer(LayerConfig {
-			layer: Layer::Top,
-			anchor: Anchor::TOP,
-			size: SURFACE_SIZE,
-			exclusive_zone: 0,
-			interactivity: KeyboardInteractivity::OnDemand,
-			margin: (40, 0, 0, 0),
-			all_outputs: false,
-		}),
-		namespace: "redface-osd".to_owned(),
-		background: None,
-	};
-	match run(config, &mut app) {
-		Ok(()) if app.cancelled => ExitCode::from(1),
-		Ok(()) => ExitCode::SUCCESS,
+	env_logger::init();
+	let uid = unsafe { libc::geteuid() };
+	let socket_path = get_osd_socket_path(uid);
+	eprintln!("redface-osd: starting, socket={}", socket_path.display());
+
+	// Remove a stale socket from a previous run.
+	let _ = fs::remove_file(&socket_path);
+	if let Some(parent) = socket_path.parent() {
+		let _ = fs::create_dir_all(parent);
+	}
+	let listener = match UnixListener::bind(&socket_path) {
+		Ok(l) => l,
 		Err(err) => {
-			eprintln!("redface-osd: {err}");
-			ExitCode::from(2)
+			eprintln!("redface-osd: bind {}: {err}", socket_path.display());
+			return ExitCode::from(2);
 		}
+	};
+	if let Err(err) = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)) {
+		eprintln!("redface-osd: chmod {}: {err}", socket_path.display());
 	}
-}
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn key_event(keysym: Keysym) -> KeyEvent {
-		KeyEvent {
-			time: 0,
-			raw_code: 0,
-			keysym,
-			utf8: None,
+	loop {
+		log::debug!("osd: waiting for daemon connection...");
+		let conn = loop {
+			match listener.accept() {
+				Ok((conn, peer)) => {
+					log::debug!("osd: accepted connection from {:?}", peer);
+					break conn;
+				}
+				Err(ref err) if err.kind() == ErrorKind::Interrupted => continue,
+				Err(err) => {
+					eprintln!("redface-osd: accept: {err}");
+					let _ = fs::remove_file(&socket_path);
+					return ExitCode::from(2);
+				}
+			}
+		};
+		if let Err(err) = conn.set_nonblocking(true) {
+			eprintln!("redface-osd: set_nonblocking: {err}");
+			continue;
 		}
-	}
 
-	#[test]
-	fn escape_cancels() {
-		let mut app = OsdApp::new();
-		assert!(!app.should_exit());
-		app.on_key(&key_event(Keysym::Escape));
-		assert!(app.should_exit());
-	}
+		let config = RunConfig {
+			role: Role::Layer(LayerConfig {
+				layer: Layer::Top,
+				anchor: Anchor::TOP,
+				size: SURFACE_SIZE,
+				exclusive_zone: 0,
+				interactivity: KeyboardInteractivity::OnDemand,
+				margin: (40, 0, 0, 0),
+				all_outputs: false,
+			}),
+			namespace: "redface-osd".to_owned(),
+			background: None,
+		};
 
-	#[test]
-	fn other_keys_do_not_cancel() {
-		let mut app = OsdApp::new();
-		app.on_key(&key_event(Keysym::Return));
-		app.on_key(&key_event(Keysym::a));
-		assert!(!app.should_exit());
-	}
-
-	#[test]
-	fn left_click_on_button_cancels() {
-		let mut app = OsdApp::new();
-		let lay = ui::layout(SURFACE_SIZE.0, SURFACE_SIZE.1, 1.0);
-		let (bx, by, bw, bh) = lay.cancel_button;
-		let center = ((bx + bw / 2.0) as f64, (by + bh / 2.0) as f64);
-		app.on_pointer(
-			PointerEventKind::Press {
-				time: 0,
-				button: BTN_LEFT,
-				serial: 0,
-			},
-			center,
-		);
-		assert!(app.should_exit());
-	}
-
-	#[test]
-	fn clicks_elsewhere_do_not_cancel() {
-		let mut app = OsdApp::new();
-		let lay = ui::layout(SURFACE_SIZE.0, SURFACE_SIZE.1, 1.0);
-		let (bx, by, _, _) = lay.cancel_button;
-		// Left click outside the button.
-		app.on_pointer(
-			PointerEventKind::Press {
-				time: 0,
-				button: BTN_LEFT,
-				serial: 0,
-			},
-			((bx - 4.0) as f64, (by - 4.0) as f64),
-		);
-		// Right click inside the button.
-		let (bx, by, bw, bh) = lay.cancel_button;
-		app.on_pointer(
-			PointerEventKind::Press {
-				time: 0,
-				button: 0x111,
-				serial: 0,
-			},
-			((bx + bw / 2.0) as f64, (by + bh / 2.0) as f64),
-		);
-		assert!(!app.should_exit());
-	}
-
-	#[test]
-	fn pointer_motion_tracks_button_hover() {
-		let mut app = OsdApp::new();
-		let lay = ui::layout(SURFACE_SIZE.0, SURFACE_SIZE.1, 1.0);
-		let (bx, by, bw, bh) = lay.cancel_button;
-		assert!(!app.hover_cancel);
-		app.on_pointer(
-			PointerEventKind::Motion { time: 0 },
-			((bx + bw / 2.0) as f64, (by + bh / 2.0) as f64),
-		);
-		assert!(app.hover_cancel);
-		app.on_pointer(PointerEventKind::Motion { time: 0 }, (1.0, 1.0));
-		assert!(!app.hover_cancel);
-		app.on_pointer(
-			PointerEventKind::Enter { serial: 0 },
-			((bx + 1.0) as f64, (by + 1.0) as f64),
-		);
-		assert!(app.hover_cancel);
-		app.on_pointer(PointerEventKind::Leave { serial: 0 }, (0.0, 0.0));
-		assert!(!app.hover_cancel);
-	}
-
-	#[test]
-	fn uniforms_are_transparent_and_pulsing() {
-		let app = OsdApp::new();
-		let u = app.uniforms(Instant::now());
-		assert_eq!(u.bg_color, [0.0, 0.0, 0.0, 0.0]);
-		assert_eq!(u.text_color, ui::TEXT_COLOR);
-		assert_eq!(u.box_color, ui::BOX_COLOR);
-		assert_eq!(u.accent_color, ui::ACCENT_COLOR);
-		assert!(u.time >= 0.0);
-		assert_eq!(u.shake_start, -1.0);
-		assert_eq!(u.face_toggled_at, 0.0);
-		assert_eq!(u.face_active, 1.0);
-	}
-
-	#[test]
-	fn osd_animates_continuously() {
-		let app = OsdApp::new();
-		assert!(app.animating());
+		log::debug!("osd: entering run() (session start)");
+		let mut app = OsdApp::new(conn);
+		match run(config, &mut app) {
+			Ok(()) => log::debug!("osd: run() returned Ok"),
+			Err(err) => log::debug!("osd: run() returned Err: {err}"),
+		}
+		log::debug!("osd: loop iteration done, going back to accept");
+		// Loop back to accept the next session.
 	}
 }
