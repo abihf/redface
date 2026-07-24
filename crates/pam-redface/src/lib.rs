@@ -8,7 +8,7 @@ use std::path::Path;
 use pam::constants::{PAM_ERROR_MSG, PAM_TEXT_INFO, PamFlag, PamResultCode};
 use pam::conv::Conv;
 use pam::module::{PamHandle, PamHooks};
-use redface_core::{AuthReq, Config, ReadJson, Res, Status};
+use redface_core::{prelude::*, Config, DaemonRequest, DaemonResponse};
 use uzers::os::unix::UserExt;
 
 struct RedfacePam;
@@ -70,10 +70,11 @@ fn authenticate(pamh: &mut PamHandle, args: Vec<&CStr>) -> PamResultCode {
 		.filter(|value| !value.is_empty())
 		.unwrap_or("pam");
 
-	let req = AuthReq {
+	let req = DaemonRequest::Authenticate {
 		client: client.into(),
 		user: user.uid().to_string(),
-		..AuthReq::default()
+		timeout: None,
+		show_osd: false,
 	};
 
 	if req.write_to(&mut conn).is_err() {
@@ -81,7 +82,7 @@ fn authenticate(pamh: &mut PamHandle, args: Vec<&CStr>) -> PamResultCode {
 		return PamResultCode::PAM_CRED_UNAVAIL;
 	}
 
-	let res = match Res::read_json(&conn) {
+	let res = match DaemonResponse::read_from(&mut conn) {
 		Ok(res) => res,
 		Err(_) => {
 			let _ = send_message(pamh, "Daemon error", true);
@@ -89,9 +90,12 @@ fn authenticate(pamh: &mut PamHandle, args: Vec<&CStr>) -> PamResultCode {
 		}
 	};
 
-	if res.status != Status::Success {
-		let _ = send_message(pamh, &res.error, true);
-		return PamResultCode::PAM_CRED_ERR;
+	match res {
+		DaemonResponse::AuthSuccess => {}
+		DaemonResponse::AuthError(ref error) => {
+			let _ = send_message(pamh, error, true);
+			return PamResultCode::PAM_CRED_ERR;
+		}
 	}
 
 	PamResultCode::PAM_SUCCESS

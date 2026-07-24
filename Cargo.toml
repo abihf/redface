@@ -9,6 +9,8 @@ redface-recognition = { path = "crates/redface-recognition", default-features = 
 redface-runtime = { path = "crates/redface-runtime", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+binary_serde = {version = "1.0", features=["std"] }
+rkyv = { version = "0.8", features = ["bytecheck"] }
 libc = "0.2"
 
 [profile.release]

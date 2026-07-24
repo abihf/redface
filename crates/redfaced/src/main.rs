@@ -12,8 +12,8 @@ use std::thread;
 use std::time::Duration;
 
 use redface_core::{
-	Action, AuthReq, Config, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR, DevicePref, ReadJson, Req, write_error_res,
-	write_success_res,
+	prelude::*,
+	Config, DaemonRequest, DaemonResponse, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR, DevicePref,
 };
 use redface_recognition::Recognizer;
 use redface_runtime::{VerifyOptions, verify};
@@ -61,22 +61,26 @@ fn handle_connection(
 	config: &Config,
 	conn: &mut UnixStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-	let req = match Req::read_json(&*conn) {
+	let req = match DaemonRequest::read_from(&mut *conn) {
 		Ok(req) => req,
-		Err(err) if err.is_eof() => return Ok(()),
+		Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
 		Err(err) => return Err(Box::new(err)),
 	};
 
-	match req.action {
-		Action::Authenticate => {
-			let auth_req = AuthReq::from(req);
-			println!("Authorizing {}", auth_req.user);
+	match req {
+		DaemonRequest::Authenticate {
+			client: _client,
+			user,
+			timeout,
+			show_osd: _show_osd,
+		} => {
+			println!("Authorizing {user}");
 
 			// Watch the socket: the client closing the connection mid-verify
 			// (timeout, Ctrl-C) must stop the camera stream immediately.
 			let disconnected = watch_disconnect(conn)?;
 
-			let timeout = if let Some(timeout) = auth_req.timeout {
+			let timeout_dur = if let Some(timeout) = timeout {
 				if timeout <= 0 {
 					None
 				} else {
@@ -86,29 +90,32 @@ fn handle_connection(
 				Some(Duration::from_secs(config.timeout))
 			};
 
-			let model_file = Path::new(DEFAULT_MODELS_DIR).join(format!("{}.face", auth_req.user));
+			let model_file = Path::new(DEFAULT_MODELS_DIR).join(format!("{user}.face"));
 			let success = verify(
 				recognizer,
 				&VerifyOptions {
 					device: PathBuf::from(&config.device),
 					face_file: model_file,
-					timeout,
+					timeout: timeout_dur,
 					threshold: config.threshold,
 					cancel: Some(disconnected),
 				},
 			);
 
 			match success {
-				Ok(true) => write_success_res(&mut *conn, std::collections::BTreeMap::new())?,
+				Ok(true) => {
+					DaemonResponse::AuthSuccess.write_to(&mut *conn)?;
+				}
 				Ok(false) => {
-					let err = io::Error::other("face not recognized");
-					write_error_res(&mut *conn, &err)?;
+					DaemonResponse::AuthError("face not recognized".to_owned()).write_to(&mut *conn)?;
 				}
 				Err(redface_runtime::VerifyError::Cancelled) => println!("Client disconnected"),
-				Err(err) => write_error_res(&mut *conn, &err)?,
+				Err(err) => {
+					DaemonResponse::AuthError(err.to_string()).write_to(&mut *conn)?;
+				}
 			}
 		}
-	};
+	}
 	Ok(())
 }
 
