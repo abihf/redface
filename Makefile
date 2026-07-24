@@ -44,7 +44,8 @@ convert-models:
 	cd data && pipx run pnnx w600k_r50.onnx 'inputshape=[1,3,112,112]' fp16=0 ncnnparam=w600k_r50.param ncnnbin=w600k_r50.bin
 	rm -f data/*.pnnx.* data/*.pnnxsim.onnx data/*_pnnx.py data/*_ncnn.py
 
-build: pam daemon check record lock osd
+build: $(RUSTFILES)
+	cargo build --release $(OPENVINO_ARGS)
 
 daemon: $(TARGET_DIR)/redfaced
 pam: $(TARGET_DIR)/libpam_redface.so
