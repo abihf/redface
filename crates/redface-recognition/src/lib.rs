@@ -5,14 +5,19 @@ use std::path::{Path, PathBuf};
 use opencv::core::{AlgorithmHint, BORDER_REPLICATE, CV_8UC1, CV_32F, Mat, Ptr, Scalar, Size};
 use opencv::prelude::*;
 use opencv::{dnn, imgproc};
+
 #[cfg(feature = "openvino")]
 use openvino::{CompiledModel, Core, DeviceType, ElementType, InferRequest, Model, PartialShape, Shape, Tensor};
-pub use redface_core::{DESCRIPTOR_LEN, Descriptor};
+
+use redface_core::{DESCRIPTOR_LEN, Descriptor};
+
+pub use redface_core::DevicePref;
 
 mod simd;
 
 #[cfg(not(any(feature = "ncnn", feature = "openvino")))]
 compile_error!("no inference backend: enable the `ncnn` (default) or `openvino` feature");
+
 #[cfg(all(feature = "ncnn", feature = "openvino"))]
 compile_error!(
 	"features `ncnn` and `openvino` are mutually exclusive; for OpenVINO build with --no-default-features --features openvino"
@@ -51,46 +56,6 @@ pub struct Rectangle {
 pub struct Face {
 	pub rectangle: Rectangle,
 	pub descriptor: Descriptor,
-}
-
-/// Preferred inference device, configured per deployment. On the OpenVINO
-/// backend (opt-in `openvino` feature) it selects the OpenVINO device; on the
-/// default ncnn backend `Npu`/`Auto` request the Vulkan GPU (with automatic
-/// CPU fallback when no Vulkan device is present) and `Cpu` forces CPU.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DevicePref {
-	/// OpenVINO "NPU" device (Intel NPU, e.g. Arrow Lake); falls back to CPU
-	/// when the NPU driver or plugin is unavailable.
-	#[default]
-	Npu,
-	/// OpenVINO "CPU" device.
-	Cpu,
-	/// Alias for `Npu` (kept for config compatibility). We deliberately avoid
-	/// OpenVINO's "AUTO:NPU,CPU" meta-plugin: a broken NPU plugin install
-	/// segfaults inside AUTO instead of returning a catchable error, which
-	/// would defeat the CPU fallback.
-	Auto,
-}
-
-impl DevicePref {
-	pub fn parse(value: &str) -> Result<Self, RecognizerError> {
-		match value.to_ascii_uppercase().as_str() {
-			"NPU" => Ok(Self::Npu),
-			"CPU" => Ok(Self::Cpu),
-			"AUTO" | "" => Ok(Self::Auto),
-			other => Err(RecognizerError::InvalidDevice(other.to_owned())),
-		}
-	}
-}
-
-impl fmt::Display for DevicePref {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Npu => write!(f, "NPU"),
-			Self::Cpu => write!(f, "CPU"),
-			Self::Auto => write!(f, "AUTO"),
-		}
-	}
 }
 
 #[derive(Debug, PartialEq)]

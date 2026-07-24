@@ -4,14 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-redface-runtime = { workspace = true }
+redface-core = { workspace = true }
 libc = { workspace = true }
 
 [[bin]]
 name = "redface-check"
 path = "src/main.rs"
-
-[features]
-default = ["ncnn"]
-ncnn = ["redface-runtime/ncnn"]
-openvino = ["redface-runtime/openvino"]

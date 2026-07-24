@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use redface_capture::{Camera, StreamAction};
-use redface_recognition::{DevicePref, Recognizer};
+use redface_core::DevicePref;
+use redface_recognition::Recognizer;
 use redface_record::{RecordEvent, RecordSession};
 
 const DEFAULT_MODEL_DIR: &str = "/usr/share/redface";

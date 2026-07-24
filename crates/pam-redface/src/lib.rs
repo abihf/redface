@@ -8,7 +8,7 @@ use std::path::Path;
 use pam::constants::{PAM_ERROR_MSG, PAM_TEXT_INFO, PamFlag, PamResultCode};
 use pam::conv::Conv;
 use pam::module::{PamHandle, PamHooks};
-use redface_runtime::{Config, Status, read_res, write_auth_req};
+use redface_core::{AuthReq, Config, ReadJson, Res, Status};
 use uzers::os::unix::UserExt;
 
 struct RedfacePam;
@@ -70,21 +70,18 @@ fn authenticate(pamh: &mut PamHandle, args: Vec<&CStr>) -> PamResultCode {
 		.filter(|value| !value.is_empty())
 		.unwrap_or("pam");
 
-	if write_auth_req(
-		&mut conn,
-		&redface_runtime::AuthReq {
-			client: client.into(),
-			user: user.uid().to_string(),
-			timeout: None,
-		},
-	)
-	.is_err()
-	{
+	let req = AuthReq {
+		client: client.into(),
+		user: user.uid().to_string(),
+		..AuthReq::default()
+	};
+
+	if req.write_to(&mut conn).is_err() {
 		let _ = send_message(pamh, "Daemon error", true);
 		return PamResultCode::PAM_CRED_UNAVAIL;
 	}
 
-	let res = match read_res(&mut conn) {
+	let res = match Res::read_json(&conn) {
 		Ok(res) => res,
 		Err(_) => {
 			let _ = send_message(pamh, "Daemon error", true);

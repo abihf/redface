@@ -50,12 +50,11 @@ daemon: $(TARGET_DIR)/redfaced
 pam: $(TARGET_DIR)/libpam_redface.so
 check: $(TARGET_DIR)/redface-check
 record: $(TARGET_DIR)/redface-record
-toolkit: $(TARGET_DIR)/libredface_toolkit.so
-lock: $(TARGET_DIR)/libredface_toolkit.so $(TARGET_DIR)/redface-lock
-osd: $(TARGET_DIR)/libredface_toolkit.so $(TARGET_DIR)/redface-osd
+lock: $(TARGET_DIR)/redface-lock
+osd: $(TARGET_DIR)/redface-osd
 
 $(TARGET_DIR)/libpam_redface.so: $(RUSTFILES)
-	cargo build --release -p pam-redface $(OPENVINO_ARGS)
+	cargo build --release -p pam-redface
 
 $(TARGET_DIR)/redfaced: $(RUSTFILES)
 	cargo build --release -p redfaced $(OPENVINO_ARGS)
@@ -66,27 +65,17 @@ $(TARGET_DIR)/redface-check: $(RUSTFILES)
 $(TARGET_DIR)/redface-record: $(RUSTFILES)
 	cargo build --release -p redface-record --bin redface-record $(OPENVINO_ARGS)
 
-# The shared Wayland/Vulkan UI toolkit is a dylib; the locker and the OSD link
-# it dynamically. prefer-dynamic picks the .so over the rlib, LTO must be off
-# (incompatible with prefer-dynamic), and the rpath covers both the target dir
-# ($$ORIGIN) and the installed location (/usr/lib).
-DYNAMIC_ARGS = -C prefer-dynamic -C link-args=-Wl,-rpath,/usr/lib,-rpath,\$$ORIGIN
-DYNAMIC_CONFIG = --config profile.release.lto=false
+$(TARGET_DIR)/redface-lock: $(RUSTFILES)
+	cargo build --release -p redface-lock $(OPENVINO_ARGS)
 
-# against it, so it must be built (and installed) alongside them.
-# The locker does no inference itself (it talks to redfaced over the socket),
-# so it is not gated by OPENVINO_ARGS. All three artifacts must come from ONE
-# cargo invocation: dynamically linked binaries record the toolkit's metadata
-# hash in their undefined symbols, and per-package builds can produce a .so
-# with a different hash (runtime "symbol lookup error").
-$(TARGET_DIR)/libredface_toolkit.so $(TARGET_DIR)/redface-lock $(TARGET_DIR)/redface-osd: $(RUSTFILES)
-	RUSTFLAGS="$(DYNAMIC_ARGS)" cargo build --release -p redface-toolkit -p redface-lock -p redface-osd $(DYNAMIC_CONFIG)
+$(TARGET_DIR)/redface-osd: $(RUSTFILES)
+	cargo build --release -p redface-osd $(OPENVINO_ARGS)
 
 #----------------------------------------------------------------------------------------
 # INSTALL
 #----------------------------------------------------------------------------------------
 
-install: install-pam install-daemon install-check install-record install-ui install-data
+install: install-pam install-daemon install-check install-record install-lock install-osd install-data
 
 install-pam: pam
 	install $(TARGET_DIR)/libpam_redface.so $(DESTDIR)$(PAMDIR)/pam_redface.so
@@ -102,11 +91,6 @@ install-check: check
 
 install-record: record
 	install $(TARGET_DIR)/redface-record $(DESTDIR)$(BINDIR)/redface-record
-
-install-ui: install-toolkit install-lock install-osd
-
-install-toolkit: toolkit
-	install $(TARGET_DIR)/libredface_toolkit.so $(DESTDIR)$(LIBDIR)/libredface_toolkit.so
 
 install-lock: lock
 	install $(TARGET_DIR)/redface-lock $(DESTDIR)$(BINDIR)/redface-lock

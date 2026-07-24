@@ -1,5 +1,5 @@
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]
 
 [env]
 # The system OpenCV 5 pkg-config file is opencv5.pc; the opencv crate probes

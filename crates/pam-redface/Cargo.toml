@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-redface-runtime = { workspace = true }
+redface-core = { workspace = true }
 pam = { package = "pam-bindings", version = "0.3.0" }
 uzers = "0.12.2"
 
@@ -12,8 +12,3 @@ uzers = "0.12.2"
 name = "pam_redface"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
-
-[features]
-default = ["ncnn"]
-ncnn = ["redface-runtime/ncnn"]
-openvino = ["redface-runtime/openvino"]

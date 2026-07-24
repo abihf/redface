@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 
-use redface_runtime::{AuthReq, Status, read_res, write_auth_req};
+use redface_core::{AuthReq, ReadJson, Res, Status};
 
 pub const PAM_SERVICE: &str = "redface-lock";
 
@@ -184,16 +184,14 @@ impl FaceAuth {
 }
 
 fn run(conn: &mut UnixStream, uid: u32) -> Result<(), String> {
-	write_auth_req(
-		&mut *conn,
-		&AuthReq {
-			client: "lock".into(),
-			user: uid.to_string(),
-			timeout: None,
-		},
-	)
+	AuthReq {
+		client: "lock".into(),
+		user: uid.to_string(),
+		..Default::default()
+	}
+	.write_to(&mut *conn)
 	.map_err(|e| format!("daemon request failed: {e}"))?;
-	let res = read_res(&mut *conn).map_err(|e| format!("daemon response failed: {e}"))?;
+	let res = Res::read_json(&mut *conn).map_err(|e| format!("daemon response failed: {e}"))?;
 	match res.status {
 		Status::Success => Ok(()),
 		Status::Error => Err(if res.error.is_empty() {

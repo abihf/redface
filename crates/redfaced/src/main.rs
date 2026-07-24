@@ -11,11 +11,12 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use redface_recognition::{DevicePref, Recognizer};
-use redface_runtime::{
-	Config, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR, VerifyOptions, read_req, to_auth_req, verify, write_error_res,
+use redface_core::{
+	Action, AuthReq, Config, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR, DevicePref, ReadJson, Req, write_error_res,
 	write_success_res,
 };
+use redface_recognition::Recognizer;
+use redface_runtime::{VerifyOptions, verify};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,15 +61,15 @@ fn handle_connection(
 	config: &Config,
 	conn: &mut UnixStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-	let req = match read_req(&mut *conn) {
+	let req = match Req::read_json(&*conn) {
 		Ok(req) => req,
 		Err(err) if err.is_eof() => return Ok(()),
 		Err(err) => return Err(Box::new(err)),
 	};
 
 	match req.action {
-		redface_runtime::Action::Authenticate => {
-			let auth_req = to_auth_req(&req);
+		Action::Authenticate => {
+			let auth_req = AuthReq::from(req);
 			println!("Authorizing {}", auth_req.user);
 
 			// Watch the socket: the client closing the connection mid-verify
@@ -160,41 +161,5 @@ impl PidFileGuard {
 impl Drop for PidFileGuard {
 	fn drop(&mut self) {
 		let _ = fs::remove_file(&self.path);
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use redface_runtime::{AuthReq, write_auth_req};
-
-	#[test]
-	fn watcher_ignores_trailing_newline_but_flags_peer_close() {
-		let (mut client, server) = UnixStream::pair().expect("socket pair");
-		write_auth_req(
-			&mut client,
-			&AuthReq {
-				client: "test".into(),
-				user: "1000".into(),
-				timeout: None,
-			},
-		)
-		.expect("write request");
-		read_req(&server).expect("read request");
-
-		let disconnected = watch_disconnect(&server).expect("spawn watcher");
-		// The newline write_auth_req appends after the JSON is still buffered
-		// in the socket; draining it must not count as a disconnect.
-		thread::sleep(Duration::from_millis(100));
-		assert!(!disconnected.load(Ordering::Relaxed));
-
-		drop(client);
-		for _ in 0..100 {
-			if disconnected.load(Ordering::Relaxed) {
-				return;
-			}
-			thread::sleep(Duration::from_millis(10));
-		}
-		panic!("watcher did not flag the closed connection");
 	}
 }

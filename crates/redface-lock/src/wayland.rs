@@ -234,9 +234,9 @@ pub fn run(config: LockConfig, background: Option<(Vec<u8>, u32, u32)>, test: bo
 	wake_rx.set_nonblocking(true)?;
 
 	let uid = unsafe { libc::geteuid() };
-	let socket_path = redface_runtime::Config::load_default()
+	let socket_path = redface_core::Config::load_default()
 		.map(|config| config.socket)
-		.unwrap_or_else(|_| redface_runtime::DEFAULT_SOCKET_PATH.to_owned());
+		.unwrap_or_else(|_| redface_core::DEFAULT_SOCKET_PATH.to_owned());
 
 	let mut app = LockApp {
 		test,

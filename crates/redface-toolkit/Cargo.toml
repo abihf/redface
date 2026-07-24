@@ -3,9 +3,6 @@ name = "redface-toolkit"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-crate-type = ["dylib", "rlib"]
-
 [dependencies]
 wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
 smithay-client-toolkit = "0.21"

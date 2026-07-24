@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 redface-recognition = { workspace = true }
 redface-runtime = { workspace = true }
+redface-core = { workspace = true }
 libc = { workspace = true }
 signal-hook = "0.4.4"
 sd-notify = "0.5"
