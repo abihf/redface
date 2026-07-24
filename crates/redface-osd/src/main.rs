@@ -5,15 +5,15 @@
 
 mod ui;
 
+use std::fs;
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 use std::time::Instant;
-use std::fs;
 
-use redface_core::{prelude::*, get_osd_socket_path, OSDNotification};
+use redface_core::{OSDNotification, get_osd_socket_path, prelude::*};
 use redface_toolkit::scene::{Scene, Uniforms};
 use redface_toolkit::text::{Fonts, GlyphAtlas};
 use redface_toolkit::{

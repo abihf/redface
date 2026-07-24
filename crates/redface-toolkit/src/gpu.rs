@@ -64,22 +64,13 @@ unsafe extern "C" {
 		share_context: EGLContext,
 		attrib_list: *const EGLint,
 	) -> EGLContext;
-	fn eglMakeCurrent(
-		dpy: EGLDisplay,
-		draw: EGLSurface,
-		read: EGLSurface,
-		ctx: EGLContext,
-	) -> EGLBoolean;
+	fn eglMakeCurrent(dpy: EGLDisplay, draw: EGLSurface, read: EGLSurface, ctx: EGLContext) -> EGLBoolean;
 	fn eglSwapBuffers(dpy: EGLDisplay, surface: EGLSurface) -> EGLBoolean;
 	#[allow(dead_code)]
 	fn eglDestroySurface(dpy: EGLDisplay, surface: EGLSurface) -> EGLBoolean;
 	fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> EGLBoolean;
 	fn eglTerminate(dpy: EGLDisplay) -> EGLBoolean;
-	fn eglCreatePbufferSurface(
-		dpy: EGLDisplay,
-		config: EGLConfig,
-		attrib_list: *const EGLint,
-	) -> EGLSurface;
+	fn eglCreatePbufferSurface(dpy: EGLDisplay, config: EGLConfig, attrib_list: *const EGLint) -> EGLSurface;
 
 	fn eglCreatePlatformWindowSurface(
 		dpy: EGLDisplay,
@@ -102,19 +93,9 @@ unsafe extern "C" {
 // libwayland-egl: wraps wl_surface into an EGL-compatible native window.
 #[link(name = "wayland-egl")]
 unsafe extern "C" {
-	fn wl_egl_window_create(
-		surface: *mut std::ffi::c_void,
-		width: i32,
-		height: i32,
-	) -> *mut std::ffi::c_void;
+	fn wl_egl_window_create(surface: *mut std::ffi::c_void, width: i32, height: i32) -> *mut std::ffi::c_void;
 	fn wl_egl_window_destroy(window: *mut std::ffi::c_void);
-	fn wl_egl_window_resize(
-		window: *mut std::ffi::c_void,
-		width: i32,
-		height: i32,
-		dx: i32,
-		dy: i32,
-	);
+	fn wl_egl_window_resize(window: *mut std::ffi::c_void, width: i32, height: i32, dx: i32, dy: i32);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +115,7 @@ fn compile_shader(gl: &glow::Context, src: &str, kind: u32) -> Result<glow::Shad
 	}
 }
 
-fn link_program(
-	gl: &glow::Context,
-	vert_src: &str,
-	frag_src: &str,
-) -> Result<glow::Program, String> {
+fn link_program(gl: &glow::Context, vert_src: &str, frag_src: &str) -> Result<glow::Program, String> {
 	unsafe {
 		let vs = compile_shader(gl, vert_src, glow::VERTEX_SHADER)?;
 		let fs = compile_shader(gl, frag_src, glow::FRAGMENT_SHADER)?;
@@ -217,12 +194,16 @@ impl Gpu {
 
 		// Try EGL 1.5 platform-aware first, then eglGetDisplay, then default.
 		let egl_display = unsafe {
-			let d = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, wl_display_ptr, [EGL_NONE as EGLAttrib].as_ptr());
-			if !d.is_null() { d }
-			else {
+			let d = eglGetPlatformDisplay(
+				EGL_PLATFORM_WAYLAND_KHR,
+				wl_display_ptr,
+				[EGL_NONE as EGLAttrib].as_ptr(),
+			);
+			if !d.is_null() {
+				d
+			} else {
 				let d = eglGetDisplay(wl_display_ptr as EGLAttrib);
-				if !d.is_null() { d }
-				else { eglGetDisplay(0) } // EGL_DEFAULT_DISPLAY
+				if !d.is_null() { d } else { eglGetDisplay(0) } // EGL_DEFAULT_DISPLAY
 			}
 		};
 		let (mut major, mut minor) = (0i32, 0i32);
@@ -247,23 +228,14 @@ impl Gpu {
 		];
 		let mut config: EGLConfig = std::ptr::null_mut();
 		let mut num_config: EGLint = 0;
-		if unsafe {
-			eglChooseConfig(
-				egl_display,
-				config_attribs.as_ptr(),
-				&mut config,
-				1,
-				&mut num_config,
-			)
-		} != EGL_TRUE || num_config == 0
+		if unsafe { eglChooseConfig(egl_display, config_attribs.as_ptr(), &mut config, 1, &mut num_config) } != EGL_TRUE
+			|| num_config == 0
 		{
 			return Err(GpuError("eglChooseConfig failed".to_owned()));
 		}
 
 		let context_attribs = [EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE];
-		let egl_context = unsafe {
-			eglCreateContext(egl_display, config, EGL_NO_CONTEXT, context_attribs.as_ptr())
-		};
+		let egl_context = unsafe { eglCreateContext(egl_display, config, EGL_NO_CONTEXT, context_attribs.as_ptr()) };
 		if egl_context.is_null() {
 			return Err(GpuError("eglCreateContext failed".to_owned()));
 		}
@@ -271,16 +243,8 @@ impl Gpu {
 		// Bootstrap: create a 1×1 pbuffer surface so we can make the context
 		// current for GL resource creation. EGL_NO_SURFACE doesn't work on
 		// all drivers (notably NVIDIA).
-		let pbuffer_attribs = [
-			EGL_WIDTH as EGLint,
-			1,
-			EGL_HEIGHT as EGLint,
-			1,
-			EGL_NONE,
-		];
-		let bootstrap_surface = unsafe {
-			eglCreatePbufferSurface(egl_display, config, pbuffer_attribs.as_ptr())
-		};
+		let pbuffer_attribs = [EGL_WIDTH as EGLint, 1, EGL_HEIGHT as EGLint, 1, EGL_NONE];
+		let bootstrap_surface = unsafe { eglCreatePbufferSurface(egl_display, config, pbuffer_attribs.as_ptr()) };
 		if bootstrap_surface.is_null() {
 			return Err(GpuError("eglCreatePbufferSurface failed".to_owned()));
 		}
@@ -344,7 +308,9 @@ impl Gpu {
 				.ok_or_else(|| GpuError("shape u_accent_color not found".to_owned()))?;
 
 			// --- Shared textures ---
-			let atlas = gl.create_texture().map_err(|e| GpuError(format!("atlas texture: {e}")))?;
+			let atlas = gl
+				.create_texture()
+				.map_err(|e| GpuError(format!("atlas texture: {e}")))?;
 			gl.bind_texture(glow::TEXTURE_2D, Some(atlas));
 			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
 			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
@@ -512,7 +478,9 @@ impl Gpu {
 		if egl_surface.is_null() {
 			let err = unsafe { eglGetError() };
 			unsafe { wl_egl_window_destroy(egl_window) };
-			return Err(GpuError(format!("eglCreatePlatformWindowSurface failed (EGL error 0x{err:x})")));
+			return Err(GpuError(format!(
+				"eglCreatePlatformWindowSurface failed (EGL error 0x{err:x})"
+			)));
 		}
 
 		Ok(GpuSurface {
@@ -556,12 +524,7 @@ impl Drop for Gpu {
 			// Unbind before destroying — some Mesa/LLVM versions corrupt
 			// internal shader-compiler state if the context is destroyed
 			// while still current, crashing on the next eglInitialize.
-			eglMakeCurrent(
-				self.egl_display,
-				EGL_NO_SURFACE,
-				EGL_NO_SURFACE,
-				EGL_NO_CONTEXT,
-			);
+			eglMakeCurrent(self.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 			eglDestroySurface(self.egl_display, self.pbuffer);
 			eglDestroyContext(self.egl_display, self.egl_context);
 			eglTerminate(self.egl_display);
@@ -619,10 +582,7 @@ impl GpuSurface {
 			let bg_tex = gpu.bg_texture.unwrap_or(gpu.placeholder);
 			gl.active_texture(glow::TEXTURE0);
 			gl.bind_texture(glow::TEXTURE_2D, Some(bg_tex));
-			gl.uniform_1_i32(
-				gl.get_uniform_location(gpu.bg_program, "u_tex").as_ref(),
-				0,
-			);
+			gl.uniform_1_i32(gl.get_uniform_location(gpu.bg_program, "u_tex").as_ref(), 0);
 			gl.uniform_4_f32(
 				gl.get_uniform_location(gpu.bg_program, "u_bg_color").as_ref(),
 				uniforms.bg_color[0],
@@ -680,11 +640,7 @@ impl GpuSurface {
 				ensure_vbo(gl, &mut self.shape_vbo, &mut self.shape_cap, scene.shapes.len());
 				let vbo = self.shape_vbo.unwrap();
 				gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-				gl.buffer_sub_data_u8_slice(
-					glow::ARRAY_BUFFER,
-					0,
-					bytemuck::cast_slice(&scene.shapes),
-				);
+				gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytemuck::cast_slice(&scene.shapes));
 
 				setup_shape_attribs(gl);
 				gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, scene.shapes.len() as i32);
@@ -702,19 +658,12 @@ impl GpuSurface {
 
 				gl.active_texture(glow::TEXTURE0);
 				gl.bind_texture(glow::TEXTURE_2D, Some(gpu.atlas));
-				gl.uniform_1_i32(
-					gl.get_uniform_location(gpu.text_program, "u_tex").as_ref(),
-					0,
-				);
+				gl.uniform_1_i32(gl.get_uniform_location(gpu.text_program, "u_tex").as_ref(), 0);
 
 				ensure_vbo(gl, &mut self.text_vbo, &mut self.text_cap, scene.texts.len());
 				let vbo = self.text_vbo.unwrap();
 				gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-				gl.buffer_sub_data_u8_slice(
-					glow::ARRAY_BUFFER,
-					0,
-					bytemuck::cast_slice(&scene.texts),
-				);
+				gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytemuck::cast_slice(&scene.texts));
 
 				setup_text_attribs(gl);
 				gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, scene.texts.len() as i32);
@@ -730,77 +679,79 @@ impl GpuSurface {
 // ---------------------------------------------------------------------------
 // Helpers
 
-unsafe fn ensure_vbo(
-	gl: &glow::Context,
-	buf: &mut Option<glow::Buffer>,
-	cap: &mut usize,
-	needed: usize,
-) { unsafe {
-	let _bytes = needed * std::mem::size_of::<ShapeInstance>()
-		.max(needed * std::mem::size_of::<TextInstance>())
-		.max(64 * std::mem::size_of::<ShapeInstance>());
-	if buf.is_some() && needed <= *cap {
-		return;
+unsafe fn ensure_vbo(gl: &glow::Context, buf: &mut Option<glow::Buffer>, cap: &mut usize, needed: usize) {
+	unsafe {
+		let _bytes = needed
+			* std::mem::size_of::<ShapeInstance>()
+				.max(needed * std::mem::size_of::<TextInstance>())
+				.max(64 * std::mem::size_of::<ShapeInstance>());
+		if buf.is_some() && needed <= *cap {
+			return;
+		}
+		let new_cap = needed.max(64).next_power_of_two();
+		if let Some(old) = buf.take() {
+			gl.delete_buffer(old);
+		}
+		let vbo = gl.create_buffer().unwrap();
+		gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+		let size_bytes = (new_cap * std::mem::size_of::<ShapeInstance>()) as i32;
+		gl.buffer_data_size(glow::ARRAY_BUFFER, size_bytes, glow::DYNAMIC_DRAW);
+		*buf = Some(vbo);
+		*cap = new_cap;
 	}
-	let new_cap = needed.max(64).next_power_of_two();
-	if let Some(old) = buf.take() {
-		gl.delete_buffer(old);
+}
+
+unsafe fn setup_shape_attribs(gl: &glow::Context) {
+	unsafe {
+		let stride = std::mem::size_of::<ShapeInstance>() as i32;
+		// a_center: 2×f32 at offset 0
+		gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+		gl.enable_vertex_attrib_array(0);
+		gl.vertex_attrib_divisor(0, 1);
+		// a_half_size: 2×f32 at offset 8
+		gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
+		gl.enable_vertex_attrib_array(1);
+		gl.vertex_attrib_divisor(1, 1);
+		// a_color: 4×f32 at offset 16
+		gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 16);
+		gl.enable_vertex_attrib_array(2);
+		gl.vertex_attrib_divisor(2, 1);
+		// a_radius: 1×f32 at offset 32
+		gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 32);
+		gl.enable_vertex_attrib_array(3);
+		gl.vertex_attrib_divisor(3, 1);
+		// a_inner_radius: 1×f32 at offset 36
+		gl.vertex_attrib_pointer_f32(4, 1, glow::FLOAT, false, stride, 36);
+		gl.enable_vertex_attrib_array(4);
+		gl.vertex_attrib_divisor(4, 1);
+		// a_birth_time: 1×f32 at offset 40
+		gl.vertex_attrib_pointer_f32(5, 1, glow::FLOAT, false, stride, 40);
+		gl.enable_vertex_attrib_array(5);
+		gl.vertex_attrib_divisor(5, 1);
+		// a_kind: 1×u32 at offset 44 (use INTEGER + UNSIGNED_INT for uint attributes)
+		gl.vertex_attrib_pointer_i32(6, 1, glow::UNSIGNED_INT, stride, 44);
+		gl.enable_vertex_attrib_array(6);
+		gl.vertex_attrib_divisor(6, 1);
 	}
-	let vbo = gl.create_buffer().unwrap();
-	gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-	let size_bytes = (new_cap * std::mem::size_of::<ShapeInstance>()) as i32;
-	gl.buffer_data_size(glow::ARRAY_BUFFER, size_bytes, glow::DYNAMIC_DRAW);
-	*buf = Some(vbo);
-	*cap = new_cap;
-}}
+}
 
-unsafe fn setup_shape_attribs(gl: &glow::Context) { unsafe {
-	let stride = std::mem::size_of::<ShapeInstance>() as i32;
-	// a_center: 2×f32 at offset 0
-	gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
-	gl.enable_vertex_attrib_array(0);
-	gl.vertex_attrib_divisor(0, 1);
-	// a_half_size: 2×f32 at offset 8
-	gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
-	gl.enable_vertex_attrib_array(1);
-	gl.vertex_attrib_divisor(1, 1);
-	// a_color: 4×f32 at offset 16
-	gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 16);
-	gl.enable_vertex_attrib_array(2);
-	gl.vertex_attrib_divisor(2, 1);
-	// a_radius: 1×f32 at offset 32
-	gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 32);
-	gl.enable_vertex_attrib_array(3);
-	gl.vertex_attrib_divisor(3, 1);
-	// a_inner_radius: 1×f32 at offset 36
-	gl.vertex_attrib_pointer_f32(4, 1, glow::FLOAT, false, stride, 36);
-	gl.enable_vertex_attrib_array(4);
-	gl.vertex_attrib_divisor(4, 1);
-	// a_birth_time: 1×f32 at offset 40
-	gl.vertex_attrib_pointer_f32(5, 1, glow::FLOAT, false, stride, 40);
-	gl.enable_vertex_attrib_array(5);
-	gl.vertex_attrib_divisor(5, 1);
-	// a_kind: 1×u32 at offset 44 (use INTEGER + UNSIGNED_INT for uint attributes)
-	gl.vertex_attrib_pointer_i32(6, 1, glow::UNSIGNED_INT, stride, 44);
-	gl.enable_vertex_attrib_array(6);
-	gl.vertex_attrib_divisor(6, 1);
-}}
-
-unsafe fn setup_text_attribs(gl: &glow::Context) { unsafe {
-	let stride = std::mem::size_of::<TextInstance>() as i32;
-	gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
-	gl.enable_vertex_attrib_array(0);
-	gl.vertex_attrib_divisor(0, 1);
-	gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
-	gl.enable_vertex_attrib_array(1);
-	gl.vertex_attrib_divisor(1, 1);
-	gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 16);
-	gl.enable_vertex_attrib_array(2);
-	gl.vertex_attrib_divisor(2, 1);
-	gl.vertex_attrib_pointer_f32(3, 2, glow::FLOAT, false, stride, 24);
-	gl.enable_vertex_attrib_array(3);
-	gl.vertex_attrib_divisor(3, 1);
-	gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, stride, 32);
-	gl.enable_vertex_attrib_array(4);
-	gl.vertex_attrib_divisor(4, 1);
-}}
+unsafe fn setup_text_attribs(gl: &glow::Context) {
+	unsafe {
+		let stride = std::mem::size_of::<TextInstance>() as i32;
+		gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+		gl.enable_vertex_attrib_array(0);
+		gl.vertex_attrib_divisor(0, 1);
+		gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
+		gl.enable_vertex_attrib_array(1);
+		gl.vertex_attrib_divisor(1, 1);
+		gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 16);
+		gl.enable_vertex_attrib_array(2);
+		gl.vertex_attrib_divisor(2, 1);
+		gl.vertex_attrib_pointer_f32(3, 2, glow::FLOAT, false, stride, 24);
+		gl.enable_vertex_attrib_array(3);
+		gl.vertex_attrib_divisor(3, 1);
+		gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, stride, 32);
+		gl.enable_vertex_attrib_array(4);
+		gl.vertex_attrib_divisor(4, 1);
+	}
+}

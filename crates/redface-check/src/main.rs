@@ -1,6 +1,6 @@
 use std::os::unix::net::UnixStream;
 
-use redface_core::{prelude::*, Config, DaemonRequest, DaemonResponse};
+use redface_core::{Config, DaemonRequest, DaemonResponse, prelude::*};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let config = Config::load_default()?;
@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	match res {
 		DaemonResponse::AuthSuccess => println!("Result success"),
 		DaemonResponse::AuthError(msg) => println!("Result {msg}"),
+		_ => println!("Result unexpected response {:?}", res),
 	}
 	Ok(())
 }

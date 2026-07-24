@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 
-use redface_core::{prelude::*, DaemonRequest, DaemonResponse};
+use redface_core::{DaemonRequest, DaemonResponse, prelude::*};
 
 pub const PAM_SERVICE: &str = "redface-lock";
 
@@ -200,5 +200,6 @@ fn run(conn: &mut UnixStream, uid: u32) -> Result<(), String> {
 		} else {
 			error
 		}),
+		_ => Err("unexpected daemon response".to_owned()),
 	}
 }

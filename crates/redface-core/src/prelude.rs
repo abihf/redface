@@ -1,8 +1,13 @@
 use std::io::{self, Read, Write};
 
 use rkyv::{
-	Archive, Deserialize, Serialize, api::high::{HighSerializer, HighValidator}, bytecheck::CheckBytes, de::Pool,
-	rancor::{self, Strategy}, ser::allocator::ArenaHandle, util::AlignedVec,
+	Archive, Deserialize, Serialize,
+	api::high::{HighSerializer, HighValidator},
+	bytecheck::CheckBytes,
+	de::Pool,
+	rancor::{self, Strategy},
+	ser::allocator::ArenaHandle,
+	util::AlignedVec,
 };
 
 pub trait ReadFrom: Archive + Sized {
@@ -20,8 +25,9 @@ where
 		let len = u16::from_le_bytes(len) as usize;
 		let mut buf = vec![0u8; len];
 		reader.read_exact(&mut buf)?;
-    let archived = rkyv::access::<Self::Archived, rancor::Error>(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    rkyv::deserialize(archived).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+		let archived = rkyv::access::<Self::Archived, rancor::Error>(&buf)
+			.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+		rkyv::deserialize(archived).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 	}
 }
 
@@ -34,8 +40,7 @@ where
 	T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
 {
 	fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-		let bytes = rkyv::to_bytes::<rancor::Error>(self)
-			.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+		let bytes = rkyv::to_bytes::<rancor::Error>(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 		let len = bytes.len() as u16;
 		writer.write_all(&len.to_le_bytes())?;
 		writer.write_all(&bytes)?;

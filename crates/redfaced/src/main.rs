@@ -12,9 +12,8 @@ use std::thread;
 use std::time::Duration;
 
 use redface_core::{
-	prelude::*,
-	Config, DaemonRequest, DaemonResponse, OSDNotification, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR,
-	DevicePref, get_osd_socket_path,
+	Config, DEFAULT_DATA_DIR, DEFAULT_MODELS_DIR, DaemonRequest, DaemonResponse, DevicePref, OSDNotification,
+	get_osd_socket_path, prelude::*,
 };
 use redface_recognition::Recognizer;
 use redface_runtime::{VerifyOptions, verify};
@@ -22,128 +21,156 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	env_logger::init();
-	let config = Config::load_default()?;
-	if is_already_running(&config.pid_file) {
-		return Err("already run".into());
-	}
-
-	let mut recognizer = Recognizer::new(DEFAULT_DATA_DIR, DevicePref::parse(&config.inference_device)?)?;
-	let _pid_guard = PidFileGuard::create(&config.pid_file)?;
-
-	let socket_path = PathBuf::from(&config.socket);
-	let _ = fs::remove_file(&socket_path);
-	let listener = UnixListener::bind(&socket_path)?;
-	fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666))?;
-	listener.set_nonblocking(true)?;
-
-	let stop = Arc::new(AtomicBool::new(false));
-	signal_hook::flag::register(SIGINT, stop.clone())?;
-	signal_hook::flag::register(SIGTERM, stop.clone())?;
-	let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
-
-	while !stop.load(Ordering::Relaxed) {
-		match listener.accept() {
-			Ok((mut conn, _)) => {
-				if let Err(err) = handle_connection(&mut recognizer, &config, &mut conn) {
-					eprintln!("Connection error: {err}");
-				}
-				let _ = conn.shutdown(Shutdown::Both);
-			}
-			Err(err) if err.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(100)),
-			Err(err) => return Err(Box::new(err)),
-		}
-	}
-
-	let _ = fs::remove_file(&socket_path);
+	let mut app = App::new()?;
+	app.run()?;
 	Ok(())
 }
 
-fn handle_connection(
-	recognizer: &mut Recognizer,
-	config: &Config,
-	conn: &mut UnixStream,
-) -> Result<(), Box<dyn std::error::Error>> {
-	let req = match DaemonRequest::read_from(&mut *conn) {
-		Ok(req) => req,
-		Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-		Err(err) => return Err(Box::new(err)),
-	};
+struct App {
+	recognizer: Recognizer,
+	config: Config,
+	pid_guard: PidFileGuard,
+}
 
-	match req {
-		DaemonRequest::Authenticate {
-			client: _client,
-			user,
-			timeout,
-			show_osd,
-		} => {
-			println!("Authorizing {user}");
+impl App {
+	fn new() -> Result<Self, Box<dyn std::error::Error>> {
+		let config = Config::load_default()?;
+		if is_already_running(&config.pid_file) {
+			return Err("already run".into());
+		}
+		let recognizer = Recognizer::new(DEFAULT_DATA_DIR, DevicePref::parse(&config.inference_device)?)?;
+		let pid_guard = PidFileGuard::create(&config.pid_file)?;
+		Ok(Self {
+			recognizer,
+			config,
+			pid_guard,
+		})
+	}
 
-			// Watch the socket: the client closing the connection mid-verify
-			// (timeout, Ctrl-C) must stop the camera stream immediately.
-			let disconnected = watch_disconnect(conn)?;
+	fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+		let socket_path = PathBuf::from(&self.config.socket);
+		let _ = fs::remove_file(&socket_path);
+		let listener = UnixListener::bind(&socket_path)?;
+		fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666))?;
+		listener.set_nonblocking(true)?;
 
-			let timeout_dur = if let Some(timeout) = timeout {
-				if timeout <= 0 {
-					None
-				} else {
-					Some(Duration::from_secs(timeout as u64))
-				}
-			} else {
-				Some(Duration::from_secs(config.timeout))
-			};
+		let stop = Arc::new(AtomicBool::new(false));
+		signal_hook::flag::register(SIGINT, stop.clone())?;
+		signal_hook::flag::register(SIGTERM, stop.clone())?;
+		let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
-			// Connect to the per-user OSD socket when the client requested
-			// visual feedback (redface-check sets show_osd = true).
-		log::debug!("daemon: show_osd={show_osd}");
-			let (mut osd_conn, osd_cancelled) = if show_osd {
-				connect_osd(&user)
-			} else {
-				None
-			}.unzip();
-			log::debug!("daemon: osd_conn={}", if osd_conn.is_some() { "connected" } else { "none" });
-
-			let model_file = Path::new(DEFAULT_MODELS_DIR).join(format!("{user}.face"));
-			let mut osd_notify = osd_conn.as_mut().map(|c| c.try_clone()).transpose()?;
-			let success = verify(
-				recognizer,
-				&VerifyOptions {
-					device: PathBuf::from(&config.device),
-					face_file: model_file,
-					timeout: timeout_dur,
-					threshold: config.threshold,
-					cancel: Some(disconnected),
-					osd_cancel: osd_cancelled,
-				},
-				|event| {
-					if let Some(ref mut stream) = osd_notify {
-						let _ = event.write_to(&mut *stream);
+		while !stop.load(Ordering::Relaxed) {
+			match listener.accept() {
+				Ok((mut conn, _)) => {
+					if let Err(err) = self.handle_connection(&mut conn) {
+						eprintln!("Connection error: {err}");
 					}
-				},
-			);
+					let _ = conn.shutdown(Shutdown::Both);
+				}
+				Err(err) if err.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(100)),
+				Err(err) => return Err(Box::new(err)),
+			}
+		}
 
-			// Send Stopped so the OSD knows the session is over.
-			if let Some(ref mut stream) = osd_conn {
+		let _ = fs::remove_file(&socket_path);
+		Ok(())
+	}
+
+	fn handle_connection(&mut self, conn: &mut UnixStream) -> Result<(), Box<dyn std::error::Error>> {
+		let req = match DaemonRequest::read_from(&mut *conn) {
+			Ok(req) => req,
+			Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+			Err(err) => return Err(Box::new(err)),
+		};
+
+		match req {
+			DaemonRequest::Authenticate {
+				client: _client,
+				user,
+				timeout,
+				show_osd,
+			} => {
+				self.handle_authentication(conn, user, timeout, show_osd)?;
+			}
+			_ => {} // Ignore other requests for now.
+		}
+		Ok(())
+	}
+
+	fn handle_authentication(
+		&mut self,
+		conn: &mut UnixStream,
+		user: String,
+		timeout: Option<i32>,
+		show_osd: bool,
+	) -> Result<(), Box<dyn std::error::Error>> {
+		println!("Authorizing {user}");
+
+		// Watch the socket: the client closing the connection mid-verify
+		// (timeout, Ctrl-C) must stop the camera stream immediately.
+		let disconnected = watch_disconnect(conn)?;
+
+		let timeout = if let Some(timeout) = timeout {
+			if timeout <= 0 {
+				None
+			} else {
+				Some(Duration::from_secs(timeout as u64))
+			}
+		} else {
+			Some(Duration::from_secs(self.config.timeout))
+		};
+
+		// Connect to the per-user OSD socket when the client requested
+		// visual feedback (redface-check sets show_osd = true).
+		log::debug!("daemon: show_osd={show_osd}");
+		let (mut osd_conn, osd_cancelled) = if show_osd { connect_osd(&user) } else { None }.unzip();
+		log::debug!(
+			"daemon: osd_conn={}",
+			if osd_conn.is_some() { "connected" } else { "none" }
+		);
+
+		let face_file = Path::new(DEFAULT_MODELS_DIR).join(format!("{user}.face"));
+		let mut osd_notify = osd_conn.as_mut().map(|c| c.try_clone()).transpose()?;
+		let threshold = self.config.threshold;
+		let success = verify(
+			&mut self.recognizer,
+			&VerifyOptions {
+				device: PathBuf::from(&self.config.device),
+				face_file,
+				timeout,
+				threshold,
+				cancel: Some(disconnected),
+				osd_cancel: osd_cancelled,
+			},
+			|event| {
+				if let Some(ref mut stream) = osd_notify {
+					let _ = event.write_to(&mut *stream);
+				}
+			},
+		);
+
+		// Send Stopped so the OSD knows the session is over.
+		if let Some(ref mut stream) = osd_conn {
 			log::debug!("daemon: sending Stopped to OSD");
 			let _ = OSDNotification::Stopped.write_to(&mut *stream);
 			let _ = stream.shutdown(Shutdown::Both);
 			log::debug!("daemon: OSD connection shut down");
-			}
+		}
 
-			match success {
-				Ok(true) => {
-					DaemonResponse::AuthSuccess.write_to(&mut *conn)?;
-				}
-				Ok(false) => {
-					DaemonResponse::AuthError("face not recognized".to_owned()).write_to(&mut *conn)?;
-				}
-				Err(redface_runtime::VerifyError::Cancelled) => println!("Client disconnected"),
-				Err(err) => {
-					DaemonResponse::AuthError(err.to_string()).write_to(&mut *conn)?;
-				}
+		match success {
+			Ok(true) => {
+				DaemonResponse::AuthSuccess.write_to(&mut *conn)?;
+			}
+			Ok(false) => {
+				DaemonResponse::AuthError("face not recognized".to_owned()).write_to(&mut *conn)?;
+			}
+			Err(redface_runtime::VerifyError::Cancelled) => println!("Client disconnected"),
+			Err(err) => {
+				DaemonResponse::AuthError(err.to_string()).write_to(&mut *conn)?;
 			}
 		}
+		Ok(())
 	}
-	Ok(())
 }
 
 /// Spawns a thread that flags the returned bool once the client is gone.

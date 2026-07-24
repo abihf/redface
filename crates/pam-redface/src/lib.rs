@@ -8,7 +8,7 @@ use std::path::Path;
 use pam::constants::{PAM_ERROR_MSG, PAM_TEXT_INFO, PamFlag, PamResultCode};
 use pam::conv::Conv;
 use pam::module::{PamHandle, PamHooks};
-use redface_core::{prelude::*, Config, DaemonRequest, DaemonResponse};
+use redface_core::{Config, DaemonRequest, DaemonResponse, prelude::*};
 use uzers::os::unix::UserExt;
 
 struct RedfacePam;

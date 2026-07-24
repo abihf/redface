@@ -1,4 +1,3 @@
-
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -10,6 +9,7 @@ pub enum DaemonRequest {
 		timeout: Option<i32>,
 		show_osd: bool,
 	},
+	Record,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -17,6 +17,7 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
 	AuthSuccess,
 	AuthError(String),
+	FaceDescriptors(Vec<u8>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Archive, Serialize, Deserialize)]

@@ -113,24 +113,24 @@ pub fn verify(
 			}
 
 			println!("* Found {} faces in {:?}", faces.len(), rec_start.elapsed());
-		for (index, face) in faces.iter().enumerate() {
-			print!("  - Face [{}]:", index);
-			for descriptor in &descriptors {
-				let similarity = descriptor.cosine_similarity(&face.descriptor);
-				print!(" {:.3}", similarity);
-				if similarity > options.threshold {
-					println!(" (found)");
-					matched = true;
-					on_event(OSDNotification::Success);
-					return StreamAction::Stop;
+			for (index, face) in faces.iter().enumerate() {
+				print!("  - Face [{}]:", index);
+				for descriptor in &descriptors {
+					let similarity = descriptor.cosine_similarity(&face.descriptor);
+					print!(" {:.3}", similarity);
+					if similarity > options.threshold {
+						println!(" (found)");
+						matched = true;
+						on_event(OSDNotification::Success);
+						return StreamAction::Stop;
+					}
 				}
+				println!();
 			}
-			println!();
-		}
 
-		// Faces seen but none matched the enrolled descriptors.
-		was_mismatch = true;
-		on_event(OSDNotification::FaceMismatch);
+			// Faces seen but none matched the enrolled descriptors.
+			was_mismatch = true;
+			on_event(OSDNotification::FaceMismatch);
 
 			StreamAction::Continue
 		})
