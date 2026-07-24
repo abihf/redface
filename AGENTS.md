@@ -30,22 +30,18 @@ built — do not treat it as live code).
   parse current glibc headers). Linked via `NCNN_DIR` (default `/usr`).
 - `crates/redface-runtime` — config (`/etc/redface/config.json`), the unix-socket
   protocol, and the `verify()` loop shared by daemon and tools.
-- `crates/redface-toolkit` — shared Wayland/Vulkan UI toolkit, built as a dylib
-  (`libredface_toolkit.so`, `crate-type = ["dylib", "rlib"]`): wraps wgpu (Vulkan
-  renderer; WGSL shaders in `shaders/`, loaded via `include_str!`) and
-  smithay-client-toolkit (ext-session-lock-v1 and wlr-layer-shell event loop)
-  behind a small app-facing API (implement the `App` trait, call `run()` with a
-  `Role`). Also owns the scene data types (`scene.rs`) and text rasterization
-  with ab_glyph/fontdb into a glyph atlas (`text.rs`). Vulkan is a hard
-  requirement — there is no CPU fallback, so a working Vulkan driver/ICD is
-  needed at runtime. The `rlib` keeps plain `cargo build`/`cargo test` working
-  (static link); release binaries link the .so via the Makefile's
-  `DYNAMIC_ARGS` (`-C prefer-dynamic`, which requires LTO off and an rpath
-  covering `$ORIGIN` and `/usr/lib`). The toolkit/lock/osd release artifacts
-  must be built in ONE cargo invocation (single Makefile rule): dynamically
-  linked binaries record the toolkit's metadata hash in their undefined
-  symbols, and separate per-package builds can produce a .so with a different
-  hash — that mismatch is a runtime "symbol lookup error".
+- `crates/redface-toolkit` — shared Wayland/GLES UI toolkit, built as a dylib
+  (`libredface_toolkit.so`, `crate-type = ["dylib", "rlib"]`): wraps EGL +
+  glow (OpenGL ES 3.0 renderer; GLSL ES shaders in `shaders/`, compiled at
+  runtime by the driver) and smithay-client-toolkit (ext-session-lock-v1 and
+  wlr-layer-shell event loop) behind a small app-facing API (implement the
+  `App` trait, call `run()` with a `Role`). Also owns the scene data types
+  (`scene.rs`) and text rasterization with ab_glyph/fontdb into a glyph atlas
+  (`text.rs`). EGL surfaces are created from pre-existing `wl_surface` objects
+  via `libwayland-egl` (`wl_egl_window_create`); the GL context is created once
+  at startup on a 1×1 pbuffer and shared across all output surfaces. No Vulkan
+  dependency — the renderer needs only `libEGL` and `libwayland-egl` (both
+  provided by Mesa).
 - `crates/redface-osd` — layer-shell feedback window (via redface-toolkit);
   for now an animated face indicator with a cancel action.
 - `crates/redface-record` — enrollment CLI (`redface-record`), writes `.face` files.
@@ -103,8 +99,8 @@ bindgen-generates against `$NCNN_DIR/include/ncnn` and links `libncnn`;
 `.cargo/config.toml` sets `NCNN_DIR=/usr`). GPU inference needs `libncnn`
 built with Vulkan plus a Vulkan driver/ICD for the GPU (ncnn falls back to
 CPU if none is present). Also v4l2 and PAM headers. The locker additionally
-needs `wayland-client` and a compositor with `ext-session-lock-v1` (Hyprland
-has it). `openvino`
+needs `wayland-client`, `libEGL`, `libwayland-egl`, and a compositor with
+`ext-session-lock-v1` (Hyprland has it). `openvino`
 is only needed when opting into the `openvino` cargo feature (the `openvino`
 crate links `libopenvino_c`; a default build has zero OpenVINO dependency),
 plus `openvino-intel-npu-plugin` + `intel-npu-driver` for NPU on that build.
@@ -197,6 +193,10 @@ Run it (plus `cargo test --workspace`) after any change to
   so its build script was rewritten; keep it a thin bindings crate.
 - No NIR/IR-trained face models exist publicly; don't add model downloads
   without documenting license and source in `README.md` + `Makefile fetch-data`.
+- The UI toolkit uses GLES (EGL + glow), not Vulkan. GLSL ES 3.00 shaders are
+  compiled by the GPU driver at runtime. `crates/ncnn` is the only place
+  ncnn FFI `unsafe` may live; the EGL FFI in `redface-toolkit` is also `unsafe`
+  but self-contained (~10 functions).
 
 ## Runtime layout (deployed)
 

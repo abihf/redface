@@ -1,8 +1,8 @@
-//! Shared Wayland/Vulkan UI toolkit for redface binaries (dylib).
+//! Shared Wayland/GLES UI toolkit for redface binaries (dylib).
 //!
-//! Wraps wgpu (Vulkan renderer, see [`gpu`]) and smithay-client-toolkit
-//! (session-lock and layer-shell event loop, see [`wayland`]) behind a small
-//! app-facing API: implement [`App`], call [`run`].
+//! Wraps EGL + glow (OpenGL ES 3.0 renderer, see [`gpu`]) and
+//! smithay-client-toolkit (session-lock and layer-shell event loop, see
+//! [`wayland`]) behind a small app-facing API: implement [`App`], call [`run`].
 
 pub mod gpu;
 pub mod scene;

@@ -129,7 +129,7 @@ struct Runner {
 	lock_denied: bool,
 	gpu: Gpu,
 	viewporter: Option<WpViewporter>,
-	/// Fatal surface-creation failure (Vulkan is a hard requirement); surfaced
+	/// Fatal surface-creation failure (GLES is a hard requirement); surfaced
 	/// as the process error after the session has been unlocked cleanly.
 	gpu_error: Option<GpuError>,
 	fonts: Fonts,
@@ -146,7 +146,7 @@ struct SurfaceEntry {
 	kind: SurfaceKind,
 	viewport: Option<WpViewport>,
 	output: Option<wl_output::WlOutput>,
-	/// Swapchain surface, created lazily at the first configure.
+	/// EGL surface, created lazily at the first configure.
 	gpu: Option<GpuSurface>,
 	/// Last built scene; rebuilt only when `scene_dirty` (state/size change),
 	/// not on pure animation frames.
@@ -284,8 +284,8 @@ impl Runner {
 			return;
 		}
 
-		// The swapchain surface is created on the first configure with a real
-		// size. Vulkan is a hard requirement: failure exits after teardown.
+		// The EGL surface is created on the first configure with a real
+		// size. GLES is a hard requirement: failure exits after teardown.
 		if self.surfaces[index].gpu.is_none() {
 			match self
 				.gpu
@@ -354,7 +354,7 @@ impl CompositorHandler for Runner {
 			return;
 		};
 		let entry = &mut self.surfaces[index];
-		// A scale>1 swapchain only displays correctly when the viewport
+		// A scale>1 viewport only displays correctly when the viewport
 		// protocol downscales it back to the logical size.
 		let factor = if entry.viewport.is_some() { factor } else { 1 };
 		if entry.scale != factor {
@@ -644,14 +644,14 @@ smithay_client_toolkit::delegate_dispatch2!(Runner);
 wayland_client::delegate_noop!(Runner: ignore WpViewporter);
 wayland_client::delegate_noop!(Runner: ignore WpViewport);
 
-/// Runs the event loop until the app exits. Vulkan is a hard requirement.
+/// Runs the event loop until the app exits. GLES is a hard requirement.
 pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
 	let conn = Connection::connect_to_env()?;
 	let (globals, mut event_queue) = registry_queue_init(&conn)?;
 	let qh = event_queue.handle();
 
-	// Vulkan is a hard requirement: no adapter/device, no UI.
-	let mut gpu = Gpu::new()?;
+	// GLES is a hard requirement: no EGL display, no UI.
+	let mut gpu = Gpu::new(&conn)?;
 	gpu.set_background(config.background.as_ref().map(|(data, w, h)| (data.as_slice(), *w, *h)));
 
 	let compositor = CompositorState::bind(&globals, &qh)?;

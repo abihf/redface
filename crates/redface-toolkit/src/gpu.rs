@@ -1,38 +1,172 @@
-//! Vulkan renderer shared by redface apps. Layout inputs come in as a `Scene`
-//! plus `Uniforms`; all animations run in the shape vertex shader off
-//! `Uniforms::time`.
+//! GLES renderer shared by redface apps, driven by EGL + glow. Layout inputs
+//! come in as a `Scene` plus `Uniforms`; all animations run in the shape
+//! vertex shader off `Uniforms::time`.
+//!
+//! EGL surfaces are created from pre-existing Wayland wl_surface objects (the
+//! caller owns those); there is no windowing library dependency.
 
-use std::borrow::Cow;
-use std::ffi::c_void;
+use std::error::Error;
+use std::ffi::CString;
 use std::fmt;
-use std::ptr::NonNull;
+use std::os::raw::c_char;
 
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
+use glow::HasContext;
 use wayland_client::Proxy;
-use wgpu::util::DeviceExt;
 
 use crate::scene::{ATLAS_SIZE, AtlasRect, Scene, ShapeInstance, TextInstance, Uniforms};
 
-const SHAPE_ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
-	0 => Float32x2,
-	1 => Float32x2,
-	2 => Float32x4,
-	3 => Float32,
-	4 => Float32,
-	5 => Float32,
-	6 => Uint32
-];
+// ---------------------------------------------------------------------------
+// EGL thin FFI — the API is tiny, no crate needed
 
-const TEXT_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-	0 => Float32x2,
-	1 => Float32x2,
-	2 => Float32x2,
-	3 => Float32x2,
-	4 => Float32x4
-];
+type EGLBoolean = u32;
+type EGLint = i32;
+type EGLAttrib = libc::intptr_t;
+type EGLDisplay = *mut std::ffi::c_void;
+type EGLConfig = *mut std::ffi::c_void;
+type EGLContext = *mut std::ffi::c_void;
+type EGLSurface = *mut std::ffi::c_void;
 
-/// Anything that prevents the Vulkan renderer from coming up. There is no
-/// fallback: the caller is expected to abort.
+const EGL_TRUE: EGLBoolean = 1;
+const EGL_NO_CONTEXT: EGLContext = std::ptr::null_mut();
+const EGL_NO_SURFACE: EGLSurface = std::ptr::null_mut();
+
+const EGL_RED_SIZE: EGLint = 0x3024;
+const EGL_GREEN_SIZE: EGLint = 0x3023;
+const EGL_BLUE_SIZE: EGLint = 0x3022;
+const EGL_ALPHA_SIZE: EGLint = 0x3021;
+const EGL_SURFACE_TYPE: EGLint = 0x3033;
+const EGL_WINDOW_BIT: EGLint = 0x0004;
+const EGL_RENDERABLE_TYPE: EGLint = 0x3040;
+const EGL_OPENGL_ES3_BIT: EGLint = 0x0040;
+const EGL_CONTEXT_MAJOR_VERSION: EGLint = 0x3098;
+const EGL_CONTEXT_MINOR_VERSION: EGLint = 0x30FB;
+const EGL_NONE: EGLint = 0x3038;
+const EGL_PLATFORM_WAYLAND_KHR: EGLint = 0x31D8;
+const EGL_WIDTH: EGLint = 0x3057;
+const EGL_HEIGHT: EGLint = 0x3056;
+#[allow(dead_code)]
+const EGL_EXTENSIONS: EGLint = 0x3055;
+
+#[link(name = "EGL")]
+unsafe extern "C" {
+	fn eglGetDisplay(native_display: EGLAttrib) -> EGLDisplay;
+	fn eglInitialize(dpy: EGLDisplay, major: *mut EGLint, minor: *mut EGLint) -> EGLBoolean;
+	fn eglChooseConfig(
+		dpy: EGLDisplay,
+		attrib_list: *const EGLint,
+		configs: *mut EGLConfig,
+		config_size: EGLint,
+		num_config: *mut EGLint,
+	) -> EGLBoolean;
+	fn eglCreateContext(
+		dpy: EGLDisplay,
+		config: EGLConfig,
+		share_context: EGLContext,
+		attrib_list: *const EGLint,
+	) -> EGLContext;
+	fn eglMakeCurrent(
+		dpy: EGLDisplay,
+		draw: EGLSurface,
+		read: EGLSurface,
+		ctx: EGLContext,
+	) -> EGLBoolean;
+	fn eglSwapBuffers(dpy: EGLDisplay, surface: EGLSurface) -> EGLBoolean;
+	#[allow(dead_code)]
+	fn eglDestroySurface(dpy: EGLDisplay, surface: EGLSurface) -> EGLBoolean;
+	fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> EGLBoolean;
+	fn eglTerminate(dpy: EGLDisplay) -> EGLBoolean;
+	fn eglCreatePbufferSurface(
+		dpy: EGLDisplay,
+		config: EGLConfig,
+		attrib_list: *const EGLint,
+	) -> EGLSurface;
+
+	fn eglCreatePlatformWindowSurface(
+		dpy: EGLDisplay,
+		config: EGLConfig,
+		native_window: *mut std::ffi::c_void,
+		attrib_list: *const EGLAttrib,
+	) -> EGLSurface;
+	fn eglGetProcAddress(procname: *const c_char) -> *mut std::ffi::c_void;
+	#[allow(dead_code)]
+	fn eglQueryString(dpy: EGLDisplay, name: EGLint) -> *const c_char;
+	fn eglSwapInterval(dpy: EGLDisplay, interval: EGLint) -> EGLBoolean;
+	fn eglGetError() -> EGLint;
+	fn eglGetPlatformDisplay(
+		platform: EGLint,
+		native_display: *mut std::ffi::c_void,
+		attrib_list: *const EGLAttrib,
+	) -> EGLDisplay;
+}
+
+// libwayland-egl: wraps wl_surface into an EGL-compatible native window.
+#[link(name = "wayland-egl")]
+unsafe extern "C" {
+	fn wl_egl_window_create(
+		surface: *mut std::ffi::c_void,
+		width: i32,
+		height: i32,
+	) -> *mut std::ffi::c_void;
+	fn wl_egl_window_destroy(window: *mut std::ffi::c_void);
+	fn wl_egl_window_resize(
+		window: *mut std::ffi::c_void,
+		width: i32,
+		height: i32,
+		dx: i32,
+		dy: i32,
+	);
+}
+
+// ---------------------------------------------------------------------------
+// GLSL shader compilation helpers
+
+fn compile_shader(gl: &glow::Context, src: &str, kind: u32) -> Result<glow::Shader, String> {
+	unsafe {
+		let shader = gl.create_shader(kind).map_err(|e| format!("create shader: {e}"))?;
+		gl.shader_source(shader, src);
+		gl.compile_shader(shader);
+		if !gl.get_shader_compile_status(shader) {
+			let log = gl.get_shader_info_log(shader);
+			gl.delete_shader(shader);
+			return Err(log);
+		}
+		Ok(shader)
+	}
+}
+
+fn link_program(
+	gl: &glow::Context,
+	vert_src: &str,
+	frag_src: &str,
+) -> Result<glow::Program, String> {
+	unsafe {
+		let vs = compile_shader(gl, vert_src, glow::VERTEX_SHADER)?;
+		let fs = compile_shader(gl, frag_src, glow::FRAGMENT_SHADER)?;
+		let program = gl.create_program().map_err(|e| format!("create program: {e}"))?;
+		gl.attach_shader(program, vs);
+		gl.attach_shader(program, fs);
+		gl.link_program(program);
+		if !gl.get_program_link_status(program) {
+			let log = gl.get_program_info_log(program);
+			gl.delete_program(program);
+			gl.delete_shader(vs);
+			gl.delete_shader(fs);
+			return Err(log);
+		}
+		// Shaders are linked into the program; we can detach and delete them.
+		gl.detach_shader(program, vs);
+		gl.detach_shader(program, fs);
+		gl.delete_shader(vs);
+		gl.delete_shader(fs);
+		Ok(program)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GpuError
+
+/// Anything that prevents the GL renderer from coming up. There is no
+/// fallback; the caller is expected to abort.
 #[derive(Debug)]
 pub struct GpuError(pub String);
 
@@ -42,641 +176,622 @@ impl fmt::Display for GpuError {
 	}
 }
 
-impl std::error::Error for GpuError {}
+impl Error for GpuError {}
 
-/// Shared GPU state: device, pipelines' layouts and the textures/bind groups
-/// used by every surface (background image, glyph atlas, uniforms).
+// ---------------------------------------------------------------------------
+// Gpu — shared GL state
+
 pub struct Gpu {
-	instance: wgpu::Instance,
-	adapter: wgpu::Adapter,
-	device: wgpu::Device,
-	queue: wgpu::Queue,
-	uniform_buffer: wgpu::Buffer,
-	sampler: wgpu::Sampler,
-	atlas: wgpu::Texture,
-	bg_texture: Option<wgpu::Texture>,
-	bg_view: Option<wgpu::TextureView>,
+	egl_display: EGLDisplay,
+	egl_config: EGLConfig,
+	egl_context: EGLContext,
+	pbuffer: EGLSurface,
+	gl: glow::Context,
+
+	// Programs
+	bg_program: glow::Program,
+	shape_program: glow::Program,
+	text_program: glow::Program,
+
+	// Shape uniform locations
+	shape_u_surface_size: glow::UniformLocation,
+	shape_u_time: glow::UniformLocation,
+	shape_u_shake_start: glow::UniformLocation,
+	shape_u_face_toggled_at: glow::UniformLocation,
+	shape_u_face_active: glow::UniformLocation,
+	shape_u_box_color: glow::UniformLocation,
+	shape_u_text_color: glow::UniformLocation,
+	shape_u_accent_color: glow::UniformLocation,
+
+	// Textures (shared across surfaces)
+	atlas: glow::Texture,
+	bg_texture: Option<glow::Texture>,
 	bg_size: [f32; 2],
-	placeholder_view: wgpu::TextureView,
-	bg_layout: wgpu::BindGroupLayout,
-	shape_layout: wgpu::BindGroupLayout,
-	text_layout: wgpu::BindGroupLayout,
-	bg_bind_group: wgpu::BindGroup,
-	shape_bind_group: wgpu::BindGroup,
-	text_bind_group: wgpu::BindGroup,
-	pipeline_cache: Option<(wgpu::PipelineCache, std::path::PathBuf)>,
+	placeholder: glow::Texture,
 }
 
 impl Gpu {
-	/// Creates a Vulkan-only instance and requests an adapter and device. Any
-	/// failure is fatal to the caller (`GpuError`), there is no fallback.
-	pub fn new() -> Result<Gpu, GpuError> {
-		let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-			backends: wgpu::Backends::VULKAN,
-			flags: wgpu::InstanceFlags::default(),
-			memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-			backend_options: wgpu::BackendOptions::default(),
-			display: None,
-		});
-		let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-			power_preference: wgpu::PowerPreference::default(),
-			compatible_surface: None,
-			force_fallback_adapter: false,
-			apply_limit_buckets: false,
-		}))
-		.map_err(|err| GpuError(format!("no Vulkan adapter available: {err}")))?;
-		let required_features = wgpu::Features::default()
-			| if adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
-				wgpu::Features::PIPELINE_CACHE
-			} else {
-				wgpu::Features::empty()
-			};
-		let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-			required_features,
-			..Default::default()
-		}))
-		.map_err(|err| GpuError(format!("failed to request device: {err}")))?;
+	pub fn new(conn: &wayland_client::Connection) -> Result<Gpu, GpuError> {
+		// --- EGL init ---
+		let wl_display_ptr = conn.backend().display_id().as_ptr() as *mut std::ffi::c_void;
 
-		// Pipeline cache persisted between runs; shortens pipeline creation
-		// when the driver's own cache is cold.
-		let pipeline_cache = wgpu::util::pipeline_cache_key(&adapter.get_info()).and_then(|key| {
-			let dir = std::env::var_os("XDG_CACHE_HOME")
-				.map(std::path::PathBuf::from)
-				.or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache")))?
-				.join("redface-lock");
-			let path = dir.join(key);
-			let data = std::fs::read(&path).ok();
-			// SAFETY: the data comes from our own cache file; wgpu validates it
-			// and falls back to an empty cache on mismatch.
-			let cache = unsafe {
-				device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-					label: Some("redface-lock"),
-					data: data.as_deref(),
-					fallback: true,
-				})
-			};
-			Some((cache, path))
-		});
-
-		let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-			label: Some("uniforms"),
-			size: std::mem::size_of::<Uniforms>() as u64,
-			usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-			mapped_at_creation: false,
-		});
-
-		let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-			label: Some("linear"),
-			mag_filter: wgpu::FilterMode::Linear,
-			min_filter: wgpu::FilterMode::Linear,
-			..Default::default()
-		});
-
-		let atlas = device.create_texture(&wgpu::TextureDescriptor {
-			label: Some("glyph atlas"),
-			size: wgpu::Extent3d {
-				width: ATLAS_SIZE,
-				height: ATLAS_SIZE,
-				depth_or_array_layers: 1,
-			},
-			mip_level_count: 1,
-			sample_count: 1,
-			dimension: wgpu::TextureDimension::D2,
-			format: wgpu::TextureFormat::R8Unorm,
-			usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-			view_formats: &[],
-		});
-		let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
-
-		// Stand-in bound while there is no background image; never sampled
-		// because the shader takes the solid-color branch then.
-		let placeholder = device.create_texture(&wgpu::TextureDescriptor {
-			label: Some("bg placeholder"),
-			size: wgpu::Extent3d {
-				width: 1,
-				height: 1,
-				depth_or_array_layers: 1,
-			},
-			mip_level_count: 1,
-			sample_count: 1,
-			dimension: wgpu::TextureDimension::D2,
-			format: wgpu::TextureFormat::Rgba8Unorm,
-			usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-			view_formats: &[],
-		});
-		let placeholder_view = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
-
-		let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-			binding,
-			visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-			ty: wgpu::BindingType::Buffer {
-				ty: wgpu::BufferBindingType::Uniform,
-				has_dynamic_offset: false,
-				min_binding_size: None,
-			},
-			count: None,
-		};
-		let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-			binding,
-			visibility: wgpu::ShaderStages::FRAGMENT,
-			ty: wgpu::BindingType::Texture {
-				sample_type: wgpu::TextureSampleType::Float { filterable: true },
-				view_dimension: wgpu::TextureViewDimension::D2,
-				multisampled: false,
-			},
-			count: None,
-		};
-		let sampler_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-			binding,
-			visibility: wgpu::ShaderStages::FRAGMENT,
-			ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-			count: None,
-		};
-
-		let bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-			label: Some("bg layout"),
-			entries: &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
-		});
-		let shape_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-			label: Some("shape layout"),
-			entries: &[uniform_entry(0)],
-		});
-		let text_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-			label: Some("text layout"),
-			entries: &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
-		});
-
-		let bg_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-			label: Some("bg bind group"),
-			layout: &bg_layout,
-			entries: &[
-				wgpu::BindGroupEntry {
-					binding: 0,
-					resource: uniform_buffer.as_entire_binding(),
-				},
-				wgpu::BindGroupEntry {
-					binding: 1,
-					resource: wgpu::BindingResource::TextureView(&placeholder_view),
-				},
-				wgpu::BindGroupEntry {
-					binding: 2,
-					resource: wgpu::BindingResource::Sampler(&sampler),
-				},
-			],
-		});
-		let shape_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-			label: Some("shape bind group"),
-			layout: &shape_layout,
-			entries: &[wgpu::BindGroupEntry {
-				binding: 0,
-				resource: uniform_buffer.as_entire_binding(),
-			}],
-		});
-		let text_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-			label: Some("text bind group"),
-			layout: &text_layout,
-			entries: &[
-				wgpu::BindGroupEntry {
-					binding: 0,
-					resource: uniform_buffer.as_entire_binding(),
-				},
-				wgpu::BindGroupEntry {
-					binding: 1,
-					resource: wgpu::BindingResource::TextureView(&atlas_view),
-				},
-				wgpu::BindGroupEntry {
-					binding: 2,
-					resource: wgpu::BindingResource::Sampler(&sampler),
-				},
-			],
-		});
-
-		Ok(Gpu {
-			instance,
-			adapter,
-			device,
-			queue,
-			uniform_buffer,
-			sampler,
-			atlas,
-			bg_texture: None,
-			bg_view: None,
-			bg_size: [0.0, 0.0],
-			placeholder_view,
-			bg_layout,
-			shape_layout,
-			text_layout,
-			bg_bind_group,
-			shape_bind_group,
-			text_bind_group,
-			pipeline_cache,
-		})
-	}
-
-	/// Uploads a straight-alpha RGBA8 background image, or switches back to
-	/// the solid `bg_color` when called with `None`.
-	pub fn set_background(&mut self, rgba: Option<(&[u8], u32, u32)>) {
-		match rgba {
-			Some((data, width, height)) if width > 0 && height > 0 => {
-				let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-					label: Some("background"),
-					size: wgpu::Extent3d {
-						width,
-						height,
-						depth_or_array_layers: 1,
-					},
-					mip_level_count: 1,
-					sample_count: 1,
-					dimension: wgpu::TextureDimension::D2,
-					format: wgpu::TextureFormat::Rgba8Unorm,
-					usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-					view_formats: &[],
-				});
-				self.queue.write_texture(
-					wgpu::TexelCopyTextureInfo {
-						texture: &texture,
-						mip_level: 0,
-						origin: wgpu::Origin3d::ZERO,
-						aspect: wgpu::TextureAspect::All,
-					},
-					data,
-					wgpu::TexelCopyBufferLayout {
-						offset: 0,
-						bytes_per_row: Some(width * 4),
-						rows_per_image: Some(height),
-					},
-					wgpu::Extent3d {
-						width,
-						height,
-						depth_or_array_layers: 1,
-					},
-				);
-				self.bg_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
-				self.bg_texture = Some(texture);
-				self.bg_size = [width as f32, height as f32];
+		// Try EGL 1.5 platform-aware first, then eglGetDisplay, then default.
+		let egl_display = unsafe {
+			let d = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, wl_display_ptr, [EGL_NONE as EGLAttrib].as_ptr());
+			if !d.is_null() { d }
+			else {
+				let d = eglGetDisplay(wl_display_ptr as EGLAttrib);
+				if !d.is_null() { d }
+				else { eglGetDisplay(0) } // EGL_DEFAULT_DISPLAY
 			}
-			_ => {
-				self.bg_texture = None;
-				self.bg_view = None;
-				self.bg_size = [0.0, 0.0];
-			}
+		};
+		let (mut major, mut minor) = (0i32, 0i32);
+		if unsafe { eglInitialize(egl_display, &mut major, &mut minor) } != EGL_TRUE {
+			return Err(GpuError("eglInitialize failed".to_owned()));
 		}
-		let view = self.bg_view.as_ref().unwrap_or(&self.placeholder_view);
-		self.bg_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-			label: Some("bg bind group"),
-			layout: &self.bg_layout,
-			entries: &[
-				wgpu::BindGroupEntry {
-					binding: 0,
-					resource: self.uniform_buffer.as_entire_binding(),
-				},
-				wgpu::BindGroupEntry {
-					binding: 1,
-					resource: wgpu::BindingResource::TextureView(view),
-				},
-				wgpu::BindGroupEntry {
-					binding: 2,
-					resource: wgpu::BindingResource::Sampler(&self.sampler),
-				},
-			],
-		});
+
+		let config_attribs = [
+			EGL_SURFACE_TYPE,
+			EGL_WINDOW_BIT,
+			EGL_RED_SIZE,
+			8,
+			EGL_GREEN_SIZE,
+			8,
+			EGL_BLUE_SIZE,
+			8,
+			EGL_ALPHA_SIZE,
+			8,
+			EGL_RENDERABLE_TYPE,
+			EGL_OPENGL_ES3_BIT,
+			EGL_NONE,
+		];
+		let mut config: EGLConfig = std::ptr::null_mut();
+		let mut num_config: EGLint = 0;
+		if unsafe {
+			eglChooseConfig(
+				egl_display,
+				config_attribs.as_ptr(),
+				&mut config,
+				1,
+				&mut num_config,
+			)
+		} != EGL_TRUE || num_config == 0
+		{
+			return Err(GpuError("eglChooseConfig failed".to_owned()));
+		}
+
+		let context_attribs = [EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE];
+		let egl_context = unsafe {
+			eglCreateContext(egl_display, config, EGL_NO_CONTEXT, context_attribs.as_ptr())
+		};
+		if egl_context.is_null() {
+			return Err(GpuError("eglCreateContext failed".to_owned()));
+		}
+
+		// Bootstrap: create a 1×1 pbuffer surface so we can make the context
+		// current for GL resource creation. EGL_NO_SURFACE doesn't work on
+		// all drivers (notably NVIDIA).
+		let pbuffer_attribs = [
+			EGL_WIDTH as EGLint,
+			1,
+			EGL_HEIGHT as EGLint,
+			1,
+			EGL_NONE,
+		];
+		let bootstrap_surface = unsafe {
+			eglCreatePbufferSurface(egl_display, config, pbuffer_attribs.as_ptr())
+		};
+		if bootstrap_surface.is_null() {
+			return Err(GpuError("eglCreatePbufferSurface failed".to_owned()));
+		}
+		unsafe {
+			eglMakeCurrent(egl_display, bootstrap_surface, bootstrap_surface, egl_context);
+		}
+
+		// --- GL via glow (needs a current context) ---
+		let gl = unsafe {
+			glow::Context::from_loader_function(|name| {
+				let cname = CString::new(name).unwrap();
+				eglGetProcAddress(cname.as_ptr())
+			})
+		};
+
+		// --- Compile shaders ---
+		let bg_program = link_program(
+			&gl,
+			include_str!("../shaders/bg.vert"),
+			include_str!("../shaders/bg.frag"),
+		)
+		.map_err(GpuError)?;
+		let shape_program = link_program(
+			&gl,
+			include_str!("../shaders/shape.vert"),
+			include_str!("../shaders/shape.frag"),
+		)
+		.map_err(GpuError)?;
+		let text_program = link_program(
+			&gl,
+			include_str!("../shaders/text.vert"),
+			include_str!("../shaders/text.frag"),
+		)
+		.map_err(GpuError)?;
+
+		// --- Uniform locations for shape (most used) ---
+		unsafe {
+			let shape_u_surface_size = gl
+				.get_uniform_location(shape_program, "u_surface_size")
+				.ok_or_else(|| GpuError("shape u_surface_size not found".to_owned()))?;
+			let shape_u_time = gl
+				.get_uniform_location(shape_program, "u_time")
+				.ok_or_else(|| GpuError("shape u_time not found".to_owned()))?;
+			let shape_u_shake_start = gl
+				.get_uniform_location(shape_program, "u_shake_start")
+				.ok_or_else(|| GpuError("shape u_shake_start not found".to_owned()))?;
+			let shape_u_face_toggled_at = gl
+				.get_uniform_location(shape_program, "u_face_toggled_at")
+				.ok_or_else(|| GpuError("shape u_face_toggled_at not found".to_owned()))?;
+			let shape_u_face_active = gl
+				.get_uniform_location(shape_program, "u_face_active")
+				.ok_or_else(|| GpuError("shape u_face_active not found".to_owned()))?;
+			let shape_u_box_color = gl
+				.get_uniform_location(shape_program, "u_box_color")
+				.ok_or_else(|| GpuError("shape u_box_color not found".to_owned()))?;
+			let shape_u_text_color = gl
+				.get_uniform_location(shape_program, "u_text_color")
+				.ok_or_else(|| GpuError("shape u_text_color not found".to_owned()))?;
+			let shape_u_accent_color = gl
+				.get_uniform_location(shape_program, "u_accent_color")
+				.ok_or_else(|| GpuError("shape u_accent_color not found".to_owned()))?;
+
+			// --- Shared textures ---
+			let atlas = gl.create_texture().map_err(|e| GpuError(format!("atlas texture: {e}")))?;
+			gl.bind_texture(glow::TEXTURE_2D, Some(atlas));
+			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+			gl.tex_image_2d(
+				glow::TEXTURE_2D,
+				0,
+				glow::R8 as i32,
+				ATLAS_SIZE as i32,
+				ATLAS_SIZE as i32,
+				0,
+				glow::RED,
+				glow::UNSIGNED_BYTE,
+				glow::PixelUnpackData::Slice(None),
+			);
+
+			let placeholder = gl.create_texture().map_err(|e| GpuError(format!("placeholder: {e}")))?;
+			gl.bind_texture(glow::TEXTURE_2D, Some(placeholder));
+			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+			gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+			let white: [u8; 4] = [255, 255, 255, 255];
+			gl.tex_image_2d(
+				glow::TEXTURE_2D,
+				0,
+				glow::RGBA8 as i32,
+				1,
+				1,
+				0,
+				glow::RGBA,
+				glow::UNSIGNED_BYTE,
+				glow::PixelUnpackData::Slice(Some(&white)),
+			);
+			gl.bind_texture(glow::TEXTURE_2D, None);
+
+			// Disable vsync; Wayland frame callbacks drive the refresh.
+			eglSwapInterval(egl_display, 0);
+
+			// Keep the pbuffer alive for background uploads etc. when no real
+			// surface is current yet. Unbind but don't destroy.
+			eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+			Ok(Gpu {
+				egl_display,
+				egl_config: config,
+				egl_context,
+				pbuffer: bootstrap_surface,
+				gl,
+				bg_program,
+				shape_program,
+				text_program,
+				shape_u_surface_size,
+				shape_u_time,
+				shape_u_shake_start,
+				shape_u_face_toggled_at,
+				shape_u_face_active,
+				shape_u_box_color,
+				shape_u_text_color,
+				shape_u_accent_color,
+				atlas,
+				bg_texture: None,
+				bg_size: [0.0, 0.0],
+				placeholder,
+			})
+		}
 	}
 
-	/// Background image size in px, or [0, 0] when rendering a solid color.
+	pub fn set_background(&mut self, rgba: Option<(&[u8], u32, u32)>) {
+		self.ensure_context();
+		unsafe {
+			let gl = &self.gl;
+			match rgba {
+				Some((data, w, h)) if w > 0 && h > 0 => {
+					let tex = match gl.create_texture() {
+						Ok(t) => t,
+						Err(_) => return,
+					};
+					gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+					gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+					gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+					gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+					gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+					gl.tex_image_2d(
+						glow::TEXTURE_2D,
+						0,
+						glow::RGBA8 as i32,
+						w as i32,
+						h as i32,
+						0,
+						glow::RGBA,
+						glow::UNSIGNED_BYTE,
+						glow::PixelUnpackData::Slice(Some(data)),
+					);
+					if let Some(old) = self.bg_texture.take() {
+						gl.delete_texture(old);
+					}
+					self.bg_texture = Some(tex);
+					self.bg_size = [w as f32, h as f32];
+				}
+				_ => {
+					if let Some(old) = self.bg_texture.take() {
+						gl.delete_texture(old);
+					}
+					self.bg_size = [0.0, 0.0];
+				}
+			}
+			gl.bind_texture(glow::TEXTURE_2D, None);
+		}
+	}
+
 	pub fn background_size(&self) -> [f32; 2] {
 		self.bg_size
 	}
 
-	/// Writes glyph coverage bitmaps into the shared R8 atlas texture.
 	pub fn upload_glyphs(&self, writes: &[(AtlasRect, Vec<u8>)]) {
-		for (rect, data) in writes {
-			if rect.w == 0 || rect.h == 0 {
-				continue;
+		self.ensure_context();
+		unsafe {
+			let gl = &self.gl;
+			gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas));
+			gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+			for (rect, data) in writes {
+				if rect.w == 0 || rect.h == 0 {
+					continue;
+				}
+				gl.tex_sub_image_2d(
+					glow::TEXTURE_2D,
+					0,
+					rect.x as i32,
+					rect.y as i32,
+					rect.w as i32,
+					rect.h as i32,
+					glow::RED,
+					glow::UNSIGNED_BYTE,
+					glow::PixelUnpackData::Slice(Some(data)),
+				);
 			}
-			debug_assert_eq!(data.len(), (rect.w * rect.h) as usize);
-			self.queue.write_texture(
-				wgpu::TexelCopyTextureInfo {
-					texture: &self.atlas,
-					mip_level: 0,
-					origin: wgpu::Origin3d {
-						x: rect.x,
-						y: rect.y,
-						z: 0,
-					},
-					aspect: wgpu::TextureAspect::All,
-				},
-				data,
-				wgpu::TexelCopyBufferLayout {
-					offset: 0,
-					bytes_per_row: Some(rect.w),
-					rows_per_image: Some(rect.h),
-				},
-				wgpu::Extent3d {
-					width: rect.w,
-					height: rect.h,
-					depth_or_array_layers: 1,
-				},
-			);
+			gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+			gl.bind_texture(glow::TEXTURE_2D, None);
 		}
 	}
 
-	/// Creates a swapchain surface for a Wayland surface.
 	pub fn create_surface(
 		&self,
-		conn: &wayland_client::Connection,
+		_conn: &wayland_client::Connection,
 		surface: &wayland_client::protocol::wl_surface::WlSurface,
 		width: u32,
 		height: u32,
 	) -> Result<GpuSurface, GpuError> {
-		let display_ptr = conn.backend().display_id().as_ptr() as *mut c_void;
-		let window_ptr = surface.id().as_ptr() as *mut c_void;
-		let display = WaylandDisplayHandle::new(
-			NonNull::new(display_ptr).ok_or_else(|| GpuError("null wl_display pointer".to_owned()))?,
-		);
-		let window = WaylandWindowHandle::new(
-			NonNull::new(window_ptr).ok_or_else(|| GpuError("null wl_surface pointer".to_owned()))?,
-		);
-		// SAFETY: both pointers come from a live wayland-client connection and
-		// proxy. The caller keeps the connection and the wl_surface alive for
-		// at least as long as the returned GpuSurface, and the instance was
-		// restricted to the Vulkan backend, matching the raw handle types.
-		let gpu_surface = unsafe {
-			self.instance
-				.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-					raw_display_handle: Some(RawDisplayHandle::Wayland(display)),
-					raw_window_handle: RawWindowHandle::Wayland(window),
-				})
+		let wl_ptr = surface.id().as_ptr() as *mut std::ffi::c_void;
+
+		// Wayland requires wrapping the wl_surface in a wl_egl_window.
+		let egl_window = unsafe { wl_egl_window_create(wl_ptr, width as i32, height as i32) };
+		if egl_window.is_null() {
+			return Err(GpuError("wl_egl_window_create returned null".to_owned()));
 		}
-		.map_err(|err| GpuError(format!("failed to create surface: {err}")))?;
 
-		let caps = gpu_surface.get_capabilities(&self.adapter);
-		// Prefer a non-sRGB format: shader outputs (uniform colors, unorm
-		// texture samples) then map 1:1 to the framebuffer, matching the old
-		// CPU rendering exactly. Fall back to whatever the surface offers.
-		let preferred = [
-			wgpu::TextureFormat::Bgra8Unorm,
-			wgpu::TextureFormat::Rgba8Unorm,
-			wgpu::TextureFormat::Bgra8UnormSrgb,
-			wgpu::TextureFormat::Rgba8UnormSrgb,
-		];
-		let format = preferred
-			.iter()
-			.copied()
-			.find(|f| caps.formats.contains(f))
-			.unwrap_or(caps.formats[0]);
-		let config = wgpu::SurfaceConfiguration {
-			usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-			format,
-			color_space: wgpu::SurfaceColorSpace::Auto,
-			width: width.max(1),
-			height: height.max(1),
-			present_mode: wgpu::PresentMode::Fifo,
-			desired_maximum_frame_latency: 2,
-			// Premultiplied alpha is required for transparent rounded layer
-			// surfaces; fall back to whatever the surface advertises first.
-			alpha_mode: if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-				wgpu::CompositeAlphaMode::PreMultiplied
-			} else {
-				caps.alpha_modes[0]
-			},
-			view_formats: vec![],
+		let egl_surface = unsafe {
+			eglCreatePlatformWindowSurface(
+				self.egl_display,
+				self.egl_config,
+				egl_window,
+				[EGL_NONE as EGLAttrib].as_ptr(),
+			)
 		};
-		gpu_surface.configure(&self.device, &config);
-
-		// Pipelines are compiled against the surface format, so they are
-		// per-surface; layouts, textures and bind groups stay shared.
-		let (bg_pipeline, shape_pipeline, text_pipeline) = create_pipelines(&self.device, format, self);
-		if let Some((cache, path)) = &self.pipeline_cache
-			&& let Some(data) = cache.get_data()
-			&& let Some(parent) = path.parent()
-		{
-			// Write atomically: tmp file + rename.
-			let tmp = path.with_extension("tmp");
-			if std::fs::create_dir_all(parent).is_ok() && std::fs::write(&tmp, &data).is_ok() {
-				let _ = std::fs::rename(&tmp, path);
-			}
+		if egl_surface.is_null() {
+			let err = unsafe { eglGetError() };
+			unsafe { wl_egl_window_destroy(egl_window) };
+			return Err(GpuError(format!("eglCreatePlatformWindowSurface failed (EGL error 0x{err:x})")));
 		}
 
 		Ok(GpuSurface {
-			surface: gpu_surface,
-			config,
-			bg_pipeline,
-			shape_pipeline,
-			text_pipeline,
-			shape_buf: None,
+			egl_surface,
+			egl_window,
+			shape_vbo: None,
 			shape_cap: 0,
-			text_buf: None,
+			text_vbo: None,
 			text_cap: 0,
+			width,
+			height,
 		})
+	}
+
+	/// Activate the GL context on the pbuffer for off-screen operations
+	/// (texture uploads, glyph uploads) when no real surface is current.
+	fn ensure_context(&self) {
+		unsafe {
+			eglMakeCurrent(self.egl_display, self.pbuffer, self.pbuffer, self.egl_context);
+		}
+	}
+
+	/// Bind the GL context to a surface (called before rendering).
+	unsafe fn make_current(&self, surface: EGLSurface) -> bool {
+		unsafe { eglMakeCurrent(self.egl_display, surface, surface, self.egl_context) == EGL_TRUE }
 	}
 }
 
-fn create_pipelines(
-	device: &wgpu::Device,
-	format: wgpu::TextureFormat,
-	gpu: &Gpu,
-) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::RenderPipeline) {
-	let module = |label: &str, src: &'static str| {
-		device.create_shader_module(wgpu::ShaderModuleDescriptor {
-			label: Some(label),
-			source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
-		})
-	};
-	let bg_module = module("bg shader", include_str!("../shaders/bg.wgsl"));
-	let shape_module = module("shape shader", include_str!("../shaders/shape.wgsl"));
-	let text_module = module("text shader", include_str!("../shaders/text.wgsl"));
-
-	let pipeline = |layout: &wgpu::BindGroupLayout,
-	                module: &wgpu::ShaderModule,
-	                buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-	                blend: wgpu::BlendState| {
-		let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-			label: None,
-			bind_group_layouts: &[Some(layout)],
-			immediate_size: 0,
-		});
-		device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-			label: None,
-			layout: Some(&pipeline_layout),
-			vertex: wgpu::VertexState {
-				module,
-				entry_point: Some("vs_main"),
-				compilation_options: wgpu::PipelineCompilationOptions::default(),
-				buffers,
-			},
-			fragment: Some(wgpu::FragmentState {
-				module,
-				entry_point: Some("fs_main"),
-				compilation_options: wgpu::PipelineCompilationOptions::default(),
-				targets: &[Some(wgpu::ColorTargetState {
-					format,
-					blend: Some(blend),
-					write_mask: wgpu::ColorWrites::ALL,
-				})],
-			}),
-			primitive: wgpu::PrimitiveState::default(),
-			depth_stencil: None,
-			multisample: wgpu::MultisampleState::default(),
-			multiview_mask: None,
-			cache: gpu.pipeline_cache.as_ref().map(|(cache, _)| cache),
-		})
-	};
-
-	let shape_vertex = wgpu::VertexBufferLayout {
-		array_stride: std::mem::size_of::<ShapeInstance>() as u64,
-		step_mode: wgpu::VertexStepMode::Instance,
-		attributes: &SHAPE_ATTRS,
-	};
-	let text_vertex = wgpu::VertexBufferLayout {
-		array_stride: std::mem::size_of::<TextInstance>() as u64,
-		step_mode: wgpu::VertexStepMode::Instance,
-		attributes: &TEXT_ATTRS,
-	};
-
-	// All shaders output premultiplied alpha (like the CPU renderer's
-	// blend_pixel), so every translucent pass uses premultiplied blending.
-	let bg_pipeline = pipeline(&gpu.bg_layout, &bg_module, &[], wgpu::BlendState::REPLACE);
-	let shape_pipeline = pipeline(
-		&gpu.shape_layout,
-		&shape_module,
-		&[Some(shape_vertex)],
-		wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-	);
-	let text_pipeline = pipeline(
-		&gpu.text_layout,
-		&text_module,
-		&[Some(text_vertex)],
-		wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-	);
-	(bg_pipeline, shape_pipeline, text_pipeline)
+impl Drop for Gpu {
+	fn drop(&mut self) {
+		unsafe {
+			let gl = &self.gl;
+			if let Some(tex) = self.bg_texture {
+				gl.delete_texture(tex);
+			}
+			gl.delete_texture(self.atlas);
+			gl.delete_texture(self.placeholder);
+			gl.delete_program(self.bg_program);
+			gl.delete_program(self.shape_program);
+			gl.delete_program(self.text_program);
+			eglDestroySurface(self.egl_display, self.pbuffer);
+			eglDestroyContext(self.egl_display, self.egl_context);
+			eglTerminate(self.egl_display);
+		}
+	}
 }
 
-/// A per-output swapchain surface plus its pipelines and instance buffers.
+// ---------------------------------------------------------------------------
+// GpuSurface — per-output state
+
 pub struct GpuSurface {
-	surface: wgpu::Surface<'static>,
-	config: wgpu::SurfaceConfiguration,
-	bg_pipeline: wgpu::RenderPipeline,
-	shape_pipeline: wgpu::RenderPipeline,
-	text_pipeline: wgpu::RenderPipeline,
-	shape_buf: Option<wgpu::Buffer>,
+	egl_surface: EGLSurface,
+	egl_window: *mut std::ffi::c_void, // wl_egl_window *
+	shape_vbo: Option<glow::Buffer>,
 	shape_cap: usize,
-	text_buf: Option<wgpu::Buffer>,
+	text_vbo: Option<glow::Buffer>,
 	text_cap: usize,
+	width: u32,
+	height: u32,
 }
 
-/// Grows `*buf` to hold at least `needed` instances, allocating on first use.
-fn ensure_instance_buffer(
-	device: &wgpu::Device,
-	buf: &mut Option<wgpu::Buffer>,
+impl Drop for GpuSurface {
+	fn drop(&mut self) {
+		unsafe { wl_egl_window_destroy(self.egl_window) };
+	}
+}
+
+impl GpuSurface {
+	pub fn resize(&mut self, _gpu: &Gpu, width: u32, height: u32) {
+		self.width = width;
+		self.height = height;
+		unsafe {
+			wl_egl_window_resize(self.egl_window, width as i32, height as i32, 0, 0);
+		}
+	}
+
+	pub fn render(&mut self, gpu: &Gpu, scene: &Scene, uniforms: &Uniforms) {
+		unsafe {
+			let gl = &gpu.gl;
+			if !gpu.make_current(self.egl_surface) {
+				return;
+			}
+
+			let w = self.width as i32;
+			let h = self.height as i32;
+
+			gl.viewport(0, 0, w, h);
+			gl.enable(glow::BLEND);
+			gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+			gl.clear_color(0.0, 0.0, 0.0, 0.0);
+			gl.clear(glow::COLOR_BUFFER_BIT);
+
+			// --- Background pass ---
+			gl.use_program(Some(gpu.bg_program));
+			let bg_tex = gpu.bg_texture.unwrap_or(gpu.placeholder);
+			gl.active_texture(glow::TEXTURE0);
+			gl.bind_texture(glow::TEXTURE_2D, Some(bg_tex));
+			gl.uniform_1_i32(
+				gl.get_uniform_location(gpu.bg_program, "u_tex").as_ref(),
+				0,
+			);
+			gl.uniform_4_f32(
+				gl.get_uniform_location(gpu.bg_program, "u_bg_color").as_ref(),
+				uniforms.bg_color[0],
+				uniforms.bg_color[1],
+				uniforms.bg_color[2],
+				uniforms.bg_color[3],
+			);
+			gl.uniform_2_f32(
+				gl.get_uniform_location(gpu.bg_program, "u_surface_size").as_ref(),
+				uniforms.surface_size[0],
+				uniforms.surface_size[1],
+			);
+			gl.uniform_2_f32(
+				gl.get_uniform_location(gpu.bg_program, "u_bg_image_size").as_ref(),
+				gpu.bg_size[0],
+				gpu.bg_size[1],
+			);
+			gl.draw_arrays(glow::TRIANGLES, 0, 3);
+
+			// --- Shape pass ---
+			if !scene.shapes.is_empty() {
+				gl.use_program(Some(gpu.shape_program));
+
+				gl.uniform_2_f32(
+					Some(&gpu.shape_u_surface_size),
+					uniforms.surface_size[0],
+					uniforms.surface_size[1],
+				);
+				gl.uniform_1_f32(Some(&gpu.shape_u_time), uniforms.time);
+				gl.uniform_1_f32(Some(&gpu.shape_u_shake_start), uniforms.shake_start);
+				gl.uniform_1_f32(Some(&gpu.shape_u_face_toggled_at), uniforms.face_toggled_at);
+				gl.uniform_1_f32(Some(&gpu.shape_u_face_active), uniforms.face_active);
+				gl.uniform_4_f32(
+					Some(&gpu.shape_u_box_color),
+					uniforms.box_color[0],
+					uniforms.box_color[1],
+					uniforms.box_color[2],
+					uniforms.box_color[3],
+				);
+				gl.uniform_4_f32(
+					Some(&gpu.shape_u_text_color),
+					uniforms.text_color[0],
+					uniforms.text_color[1],
+					uniforms.text_color[2],
+					uniforms.text_color[3],
+				);
+				gl.uniform_4_f32(
+					Some(&gpu.shape_u_accent_color),
+					uniforms.accent_color[0],
+					uniforms.accent_color[1],
+					uniforms.accent_color[2],
+					uniforms.accent_color[3],
+				);
+
+				ensure_vbo(gl, &mut self.shape_vbo, &mut self.shape_cap, scene.shapes.len());
+				let vbo = self.shape_vbo.unwrap();
+				gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+				gl.buffer_sub_data_u8_slice(
+					glow::ARRAY_BUFFER,
+					0,
+					bytemuck::cast_slice(&scene.shapes),
+				);
+
+				setup_shape_attribs(gl);
+				gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, scene.shapes.len() as i32);
+			}
+
+			// --- Text pass ---
+			if !scene.texts.is_empty() {
+				gl.use_program(Some(gpu.text_program));
+
+				gl.uniform_2_f32(
+					gl.get_uniform_location(gpu.text_program, "u_surface_size").as_ref(),
+					uniforms.surface_size[0],
+					uniforms.surface_size[1],
+				);
+
+				gl.active_texture(glow::TEXTURE0);
+				gl.bind_texture(glow::TEXTURE_2D, Some(gpu.atlas));
+				gl.uniform_1_i32(
+					gl.get_uniform_location(gpu.text_program, "u_tex").as_ref(),
+					0,
+				);
+
+				ensure_vbo(gl, &mut self.text_vbo, &mut self.text_cap, scene.texts.len());
+				let vbo = self.text_vbo.unwrap();
+				gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+				gl.buffer_sub_data_u8_slice(
+					glow::ARRAY_BUFFER,
+					0,
+					bytemuck::cast_slice(&scene.texts),
+				);
+
+				setup_text_attribs(gl);
+				gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, scene.texts.len() as i32);
+			}
+
+			gl.bind_buffer(glow::ARRAY_BUFFER, None);
+
+			eglSwapBuffers(gpu.egl_display, self.egl_surface);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+
+unsafe fn ensure_vbo(
+	gl: &glow::Context,
+	buf: &mut Option<glow::Buffer>,
 	cap: &mut usize,
 	needed: usize,
-	elem_size: usize,
-	label: &str,
-) {
+) { unsafe {
+	let _bytes = needed * std::mem::size_of::<ShapeInstance>()
+		.max(needed * std::mem::size_of::<TextInstance>())
+		.max(64 * std::mem::size_of::<ShapeInstance>());
 	if buf.is_some() && needed <= *cap {
 		return;
 	}
 	let new_cap = needed.max(64).next_power_of_two();
-	*buf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-		label: Some(label),
-		contents: &vec![0u8; new_cap * elem_size],
-		usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-	}));
+	if let Some(old) = buf.take() {
+		gl.delete_buffer(old);
+	}
+	let vbo = gl.create_buffer().unwrap();
+	gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+	let size_bytes = (new_cap * std::mem::size_of::<ShapeInstance>()) as i32;
+	gl.buffer_data_size(glow::ARRAY_BUFFER, size_bytes, glow::DYNAMIC_DRAW);
+	*buf = Some(vbo);
 	*cap = new_cap;
-}
+}}
 
-impl GpuSurface {
-	/// Reconfigures the swapchain after an output resize.
-	pub fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
-		if width == 0 || height == 0 {
-			return;
-		}
-		self.config.width = width;
-		self.config.height = height;
-		self.surface.configure(&gpu.device, &self.config);
-	}
+unsafe fn setup_shape_attribs(gl: &glow::Context) { unsafe {
+	let stride = std::mem::size_of::<ShapeInstance>() as i32;
+	// a_center: 2×f32 at offset 0
+	gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+	gl.enable_vertex_attrib_array(0);
+	gl.vertex_attrib_divisor(0, 1);
+	// a_half_size: 2×f32 at offset 8
+	gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
+	gl.enable_vertex_attrib_array(1);
+	gl.vertex_attrib_divisor(1, 1);
+	// a_color: 4×f32 at offset 16
+	gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 16);
+	gl.enable_vertex_attrib_array(2);
+	gl.vertex_attrib_divisor(2, 1);
+	// a_radius: 1×f32 at offset 32
+	gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 32);
+	gl.enable_vertex_attrib_array(3);
+	gl.vertex_attrib_divisor(3, 1);
+	// a_inner_radius: 1×f32 at offset 36
+	gl.vertex_attrib_pointer_f32(4, 1, glow::FLOAT, false, stride, 36);
+	gl.enable_vertex_attrib_array(4);
+	gl.vertex_attrib_divisor(4, 1);
+	// a_birth_time: 1×f32 at offset 40
+	gl.vertex_attrib_pointer_f32(5, 1, glow::FLOAT, false, stride, 40);
+	gl.enable_vertex_attrib_array(5);
+	gl.vertex_attrib_divisor(5, 1);
+	// a_kind: 1×u32 at offset 44 (use INTEGER + UNSIGNED_INT for uint attributes)
+	gl.vertex_attrib_pointer_i32(6, 1, glow::UNSIGNED_INT, stride, 44);
+	gl.enable_vertex_attrib_array(6);
+	gl.vertex_attrib_divisor(6, 1);
+}}
 
-	/// Renders one frame: background, then shapes, then text, in a single
-	/// render pass. Swapchain errors are recovered from by reconfiguring once;
-	/// anything else drops the frame.
-	pub fn render(&mut self, gpu: &Gpu, scene: &Scene, uniforms: &Uniforms) {
-		ensure_instance_buffer(
-			&gpu.device,
-			&mut self.shape_buf,
-			&mut self.shape_cap,
-			scene.shapes.len(),
-			std::mem::size_of::<ShapeInstance>(),
-			"shape instances",
-		);
-		ensure_instance_buffer(
-			&gpu.device,
-			&mut self.text_buf,
-			&mut self.text_cap,
-			scene.texts.len(),
-			std::mem::size_of::<TextInstance>(),
-			"text instances",
-		);
-		if !scene.shapes.is_empty() {
-			gpu.queue
-				.write_buffer(self.shape_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&scene.shapes));
-		}
-		if !scene.texts.is_empty() {
-			gpu.queue
-				.write_buffer(self.text_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&scene.texts));
-		}
-		gpu.queue
-			.write_buffer(&gpu.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-
-		use wgpu::CurrentSurfaceTexture as Cst;
-		let frame = match self.surface.get_current_texture() {
-			Cst::Success(frame) | Cst::Suboptimal(frame) => frame,
-			Cst::Lost | Cst::Outdated => {
-				self.surface.configure(&gpu.device, &self.config);
-				match self.surface.get_current_texture() {
-					Cst::Success(frame) | Cst::Suboptimal(frame) => frame,
-					_ => return,
-				}
-			}
-			_ => return,
-		};
-		let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-		let mut encoder = gpu
-			.device
-			.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-		{
-			let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-				label: Some("lock screen"),
-				color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-					view: &view,
-					resolve_target: None,
-					ops: wgpu::Operations {
-						load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-						store: wgpu::StoreOp::Store,
-					},
-					depth_slice: None,
-				})],
-				depth_stencil_attachment: None,
-				timestamp_writes: None,
-				occlusion_query_set: None,
-				multiview_mask: None,
-			});
-			pass.set_pipeline(&self.bg_pipeline);
-			pass.set_bind_group(0, &gpu.bg_bind_group, &[]);
-			pass.draw(0..3, 0..1);
-			if !scene.shapes.is_empty() {
-				pass.set_pipeline(&self.shape_pipeline);
-				pass.set_bind_group(0, &gpu.shape_bind_group, &[]);
-				pass.set_vertex_buffer(0, self.shape_buf.as_ref().unwrap().slice(..));
-				pass.draw(0..6, 0..scene.shapes.len() as u32);
-			}
-			if !scene.texts.is_empty() {
-				pass.set_pipeline(&self.text_pipeline);
-				pass.set_bind_group(0, &gpu.text_bind_group, &[]);
-				pass.set_vertex_buffer(0, self.text_buf.as_ref().unwrap().slice(..));
-				pass.draw(0..6, 0..scene.texts.len() as u32);
-			}
-		}
-		gpu.queue.submit([encoder.finish()]);
-		gpu.queue.present(frame);
-	}
-}
+unsafe fn setup_text_attribs(gl: &glow::Context) { unsafe {
+	let stride = std::mem::size_of::<TextInstance>() as i32;
+	gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+	gl.enable_vertex_attrib_array(0);
+	gl.vertex_attrib_divisor(0, 1);
+	gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
+	gl.enable_vertex_attrib_array(1);
+	gl.vertex_attrib_divisor(1, 1);
+	gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 16);
+	gl.enable_vertex_attrib_array(2);
+	gl.vertex_attrib_divisor(2, 1);
+	gl.vertex_attrib_pointer_f32(3, 2, glow::FLOAT, false, stride, 24);
+	gl.enable_vertex_attrib_array(3);
+	gl.vertex_attrib_divisor(3, 1);
+	gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, stride, 32);
+	gl.enable_vertex_attrib_array(4);
+	gl.vertex_attrib_divisor(4, 1);
+}}
