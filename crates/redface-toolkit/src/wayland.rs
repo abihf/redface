@@ -462,7 +462,7 @@ impl SessionLockHandler for Runner {
 		qh: &QueueHandle<Self>,
 		surface: SessionLockSurface,
 		configure: SessionLockSurfaceConfigure,
-		_: u32,
+		_serial: u32,
 	) {
 		let Some(index) = self.surface_index(surface.wl_surface()) else {
 			return;

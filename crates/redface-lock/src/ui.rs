@@ -20,6 +20,7 @@ pub struct UiState {
 	shake_start: Option<Instant>,
 	pub message: Option<String>,
 	pub hover_face: bool,
+	dot_births_cache: Vec<f32>,
 }
 
 impl Default for UiState {
@@ -37,6 +38,7 @@ impl UiState {
 			shake_start: None,
 			message: None,
 			hover_face: false,
+			dot_births_cache: Vec::new(),
 		}
 	}
 
@@ -118,11 +120,12 @@ impl UiState {
 
 	/// Birth time (seconds since `epoch`) of each password dot, in the order
 	/// the characters were typed.
-	pub fn dot_births(&self, epoch: Instant) -> Vec<f32> {
-		self.password
-			.iter()
-			.map(|(_, t)| t.saturating_duration_since(epoch).as_secs_f32())
-			.collect()
+	pub fn dot_births(&mut self, epoch: Instant) -> &[f32] {
+		self.dot_births_cache.clear();
+		for (_, t) in &self.password {
+			self.dot_births_cache.push(t.saturating_duration_since(epoch).as_secs_f32());
+		}
+		&self.dot_births_cache
 	}
 }
 
@@ -231,7 +234,7 @@ fn push_text(
 /// always the rest positions.
 #[allow(clippy::too_many_arguments)]
 pub fn build_scene(
-	state: &UiState,
+	state: &mut UiState,
 	config: &LockConfig,
 	fonts: &Fonts,
 	atlas: &mut GlyphAtlas,
@@ -335,7 +338,7 @@ pub fn build_scene(
 		let total = (state.password_len() as f32 - 1.0) * spacing;
 		let start_x = cx - total / 2.0;
 		let radius = 5.0 * scale;
-		for (i, birth) in state.dot_births(epoch).into_iter().enumerate() {
+		for (i, &birth) in state.dot_births(epoch).iter().enumerate() {
 			scene.shapes.push(ShapeInstance {
 				center: [start_x + i as f32 * spacing, by + bh / 2.0],
 				half_size: [radius, radius],
@@ -504,10 +507,10 @@ mod tests {
 		ui.push_char('a');
 		ui.push_char('b');
 		ui.push_char('c');
-		let births = ui.dot_births(epoch);
-		assert_eq!(births.len(), ui.password_len());
-		assert!(births.iter().all(|b| *b >= 0.0));
-		assert!(births.windows(2).all(|w| w[0] <= w[1]));
+		let len = ui.dot_births(epoch).len();
+		assert_eq!(len, ui.password_len());
+		assert!(ui.dot_births(epoch).iter().all(|b| *b >= 0.0));
+		assert!(ui.dot_births(epoch).windows(2).all(|w| w[0] <= w[1]));
 		ui.backspace();
 		assert_eq!(ui.dot_births(epoch).len(), 2);
 	}
@@ -531,7 +534,7 @@ mod tests {
 		let mut state = UiState::new();
 		state.push_char('a');
 		state.push_char('b');
-		let scene = build_scene(&state, &config, &fonts, &mut atlas, 1920, 1080, 1.0, epoch);
+		let scene = build_scene(&mut state, &config, &fonts, &mut atlas, 1920, 1080, 1.0, epoch);
 		// Backdrop + box + border + disc + ring + head + 2 eyes + 2 dots.
 		assert_eq!(scene.shapes.len(), 10);
 		let births: Vec<f32> = scene
@@ -553,8 +556,8 @@ mod tests {
 		let Ok(fonts) = Fonts::load() else { return };
 		let mut atlas = GlyphAtlas::new();
 		let config = LockConfig::default();
-		let state = UiState::new();
-		let scene = build_scene(&state, &config, &fonts, &mut atlas, 1920, 1080, 1.0, Instant::now());
+		let mut state = UiState::new();
+		let scene = build_scene(&mut state, &config, &fonts, &mut atlas, 1920, 1080, 1.0, Instant::now());
 		assert!(!scene.shapes.iter().any(|s| s.kind == SHAPE_DOT));
 		// Placeholder quads (alpha 0.35) sit inside the password box.
 		let (_, by, _, bh) = layout(1920, 1080, 1.0).password_box;

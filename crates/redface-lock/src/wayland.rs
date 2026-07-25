@@ -128,7 +128,7 @@ impl App for LockApp {
 			// Secondary monitors only show the background.
 			return Scene::default();
 		}
-		ui::build_scene(&self.ui, &self.config, fonts, atlas, width, height, scale, epoch)
+		ui::build_scene(&mut self.ui, &self.config, fonts, atlas, width, height, scale, epoch)
 	}
 
 	fn primary_output(&self) -> Option<String> {

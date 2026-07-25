@@ -180,6 +180,16 @@ pub struct Gpu {
 	shape_u_text_color: glow::UniformLocation,
 	shape_u_accent_color: glow::UniformLocation,
 
+	// BG uniform locations
+	bg_u_tex: glow::UniformLocation,
+	bg_u_bg_color: glow::UniformLocation,
+	bg_u_surface_size: glow::UniformLocation,
+	bg_u_bg_image_size: glow::UniformLocation,
+
+	// Text uniform locations
+	text_u_surface_size: glow::UniformLocation,
+	text_u_tex: glow::UniformLocation,
+
 	// Textures (shared across surfaces)
 	atlas: glow::Texture,
 	bg_texture: Option<glow::Texture>,
@@ -307,6 +317,28 @@ impl Gpu {
 				.get_uniform_location(shape_program, "u_accent_color")
 				.ok_or_else(|| GpuError("shape u_accent_color not found".to_owned()))?;
 
+			// BG uniform locations (cached to avoid driver lookups per frame).
+			let bg_u_tex = gl
+				.get_uniform_location(bg_program, "u_tex")
+				.ok_or_else(|| GpuError("bg u_tex not found".to_owned()))?;
+			let bg_u_bg_color = gl
+				.get_uniform_location(bg_program, "u_bg_color")
+				.ok_or_else(|| GpuError("bg u_bg_color not found".to_owned()))?;
+			let bg_u_surface_size = gl
+				.get_uniform_location(bg_program, "u_surface_size")
+				.ok_or_else(|| GpuError("bg u_surface_size not found".to_owned()))?;
+			let bg_u_bg_image_size = gl
+				.get_uniform_location(bg_program, "u_bg_image_size")
+				.ok_or_else(|| GpuError("bg u_bg_image_size not found".to_owned()))?;
+
+			// Text uniform locations.
+			let text_u_surface_size = gl
+				.get_uniform_location(text_program, "u_surface_size")
+				.ok_or_else(|| GpuError("text u_surface_size not found".to_owned()))?;
+			let text_u_tex = gl
+				.get_uniform_location(text_program, "u_tex")
+				.ok_or_else(|| GpuError("text u_tex not found".to_owned()))?;
+
 			// --- Shared textures ---
 			let atlas = gl
 				.create_texture()
@@ -370,6 +402,12 @@ impl Gpu {
 				shape_u_box_color,
 				shape_u_text_color,
 				shape_u_accent_color,
+				bg_u_tex,
+				bg_u_bg_color,
+				bg_u_surface_size,
+				bg_u_bg_image_size,
+				text_u_surface_size,
+				text_u_tex,
 				atlas,
 				bg_texture: None,
 				bg_size: [0.0, 0.0],
@@ -582,21 +620,21 @@ impl GpuSurface {
 			let bg_tex = gpu.bg_texture.unwrap_or(gpu.placeholder);
 			gl.active_texture(glow::TEXTURE0);
 			gl.bind_texture(glow::TEXTURE_2D, Some(bg_tex));
-			gl.uniform_1_i32(gl.get_uniform_location(gpu.bg_program, "u_tex").as_ref(), 0);
+			gl.uniform_1_i32(Some(&gpu.bg_u_tex), 0);
 			gl.uniform_4_f32(
-				gl.get_uniform_location(gpu.bg_program, "u_bg_color").as_ref(),
+				Some(&gpu.bg_u_bg_color),
 				uniforms.bg_color[0],
 				uniforms.bg_color[1],
 				uniforms.bg_color[2],
 				uniforms.bg_color[3],
 			);
 			gl.uniform_2_f32(
-				gl.get_uniform_location(gpu.bg_program, "u_surface_size").as_ref(),
+				Some(&gpu.bg_u_surface_size),
 				uniforms.surface_size[0],
 				uniforms.surface_size[1],
 			);
 			gl.uniform_2_f32(
-				gl.get_uniform_location(gpu.bg_program, "u_bg_image_size").as_ref(),
+				Some(&gpu.bg_u_bg_image_size),
 				gpu.bg_size[0],
 				gpu.bg_size[1],
 			);
@@ -651,14 +689,14 @@ impl GpuSurface {
 				gl.use_program(Some(gpu.text_program));
 
 				gl.uniform_2_f32(
-					gl.get_uniform_location(gpu.text_program, "u_surface_size").as_ref(),
+					Some(&gpu.text_u_surface_size),
 					uniforms.surface_size[0],
 					uniforms.surface_size[1],
 				);
 
 				gl.active_texture(glow::TEXTURE0);
 				gl.bind_texture(glow::TEXTURE_2D, Some(gpu.atlas));
-				gl.uniform_1_i32(gl.get_uniform_location(gpu.text_program, "u_tex").as_ref(), 0);
+				gl.uniform_1_i32(Some(&gpu.text_u_tex), 0);
 
 				ensure_vbo(gl, &mut self.text_vbo, &mut self.text_cap, scene.texts.len());
 				let vbo = self.text_vbo.unwrap();
@@ -681,10 +719,6 @@ impl GpuSurface {
 
 unsafe fn ensure_vbo(gl: &glow::Context, buf: &mut Option<glow::Buffer>, cap: &mut usize, needed: usize) {
 	unsafe {
-		let _bytes = needed
-			* std::mem::size_of::<ShapeInstance>()
-				.max(needed * std::mem::size_of::<TextInstance>())
-				.max(64 * std::mem::size_of::<ShapeInstance>());
 		if buf.is_some() && needed <= *cap {
 			return;
 		}

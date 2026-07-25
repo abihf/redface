@@ -43,6 +43,8 @@ struct OsdApp {
 	epoch: Instant,
 	/// Set by `on_tick` / `apply_notification` when the scene needs a rebuild.
 	needs_redraw: bool,
+	/// Precomputed screen geometry for hit-testing.
+	lay: ui::Layout,
 }
 
 impl OsdApp {
@@ -56,6 +58,7 @@ impl OsdApp {
 			face_color: ui::ACCENT_COLOR, // blue = Verifying
 			epoch: Instant::now(),
 			needs_redraw: true,
+			lay: ui::layout(SURFACE_SIZE.0, SURFACE_SIZE.1, 1.0),
 		}
 	}
 
@@ -141,14 +144,16 @@ impl App for OsdApp {
 	}
 
 	fn on_pointer(&mut self, kind: PointerEventKind, position: (f64, f64)) {
-		let lay = ui::layout(SURFACE_SIZE.0, SURFACE_SIZE.1, 1.0);
 		match kind {
 			PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-				self.hover_cancel = ui::hit_cancel(&lay, position.0, position.1);
+				let hit = ui::hit_cancel(&self.lay, position.0, position.1);
+				if hit != self.hover_cancel {
+					self.hover_cancel = hit;
+				}
 			}
 			PointerEventKind::Leave { .. } => self.hover_cancel = false,
 			PointerEventKind::Press { button, .. }
-				if button == BTN_LEFT && ui::hit_cancel(&lay, position.0, position.1) =>
+				if button == BTN_LEFT && ui::hit_cancel(&self.lay, position.0, position.1) =>
 			{
 				if self.stopped_at.is_some() {
 					self.dismiss();
