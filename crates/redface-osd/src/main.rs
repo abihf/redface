@@ -67,17 +67,18 @@ impl OsdApp {
 			OSDNotification::Verifying => ui::ACCENT_COLOR,
 			OSDNotification::Success => ui::SUCCESS_COLOR,
 			OSDNotification::FaceMismatch => ui::MISMATCH_COLOR,
-			// Keep the last active colour; the 3 s fade-out is driven by
-			// stopped_at rather than the colour.
 			OSDNotification::Stopped | OSDNotification::Cancelling => self.face_color,
 		};
 		self.notification = notif;
 		self.needs_redraw = true;
-		// Start the 3-second hide timer as soon as the daemon tells us
-		// the session is over, not only on the subsequent EOF.
 		if matches!(self.notification, OSDNotification::Stopped) && self.stopped_at.is_none() {
-			log::debug!("osd: received Stopped, starting 3s hide timer");
-			self.stopped_at = Some(Instant::now());
+			if self.cancelled_by_user {
+				log::debug!("osd: received Stopped after user cancel, dismissing immediately");
+				self.dismiss();
+			} else {
+				log::debug!("osd: received Stopped, starting 3s hide timer");
+				self.stopped_at = Some(Instant::now());
+			}
 		}
 	}
 
