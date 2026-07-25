@@ -49,6 +49,7 @@ pub struct CaptureStats {
 #[derive(Default)]
 struct FrameSlot {
 	frame: Option<Frame>,
+	recycle: Option<Vec<u8>>,
 	stats: CaptureStats,
 	error: Option<CaptureError>,
 	stop: bool,
@@ -110,7 +111,7 @@ impl Camera {
 		Self { device: device.into() }
 	}
 
-	pub fn stream(&self, mut on_frame: impl FnMut(Frame) -> StreamAction) -> Result<CaptureStats, CaptureError> {
+	pub fn stream(&self, mut on_frame: impl FnMut(&Frame) -> StreamAction) -> Result<CaptureStats, CaptureError> {
 		let device = Device::with_path(&self.device).map_err(|source| CaptureError::OpenDevice {
 			path: self.device.clone(),
 			source,
@@ -176,8 +177,10 @@ impl Camera {
 					continue;
 				}
 
+				let recycle = lock.lock().unwrap().recycle.take();
+
 				let frame = Frame {
-					buffer: convert_to_gray(fourcc, raw),
+					buffer: convert_to_gray(fourcc, raw, recycle),
 					width,
 					height,
 				};
@@ -206,7 +209,9 @@ impl Camera {
 				slot.frame.take().expect("frame present when error is none")
 			};
 
-			if matches!(on_frame(frame), StreamAction::Stop) {
+			let action = on_frame(&frame);
+			lock.lock().unwrap().recycle = Some(frame.buffer);
+			if matches!(action, StreamAction::Stop) {
 				lock.lock().unwrap().stop = true;
 				break Ok(());
 			}
@@ -253,9 +258,12 @@ fn is_supported_color_format(fourcc: FourCC) -> bool {
 	fourcc == GREY_FOURCC || fourcc == RGB3_FOURCC || fourcc == YUYV_FOURCC
 }
 
-fn convert_to_gray(fourcc: FourCC, raw: &[u8]) -> Vec<u8> {
+fn convert_to_gray(fourcc: FourCC, raw: &[u8], recycle: Option<Vec<u8>>) -> Vec<u8> {
 	if fourcc == GREY_FOURCC {
-		raw.to_vec()
+		let mut buf = recycle.unwrap_or_else(|| Vec::with_capacity(raw.len()));
+		buf.resize(raw.len(), 0);
+		buf.copy_from_slice(raw);
+		buf
 	} else if fourcc == RGB3_FOURCC {
 		rgb_to_gray(raw)
 	} else if fourcc == YUYV_FOURCC {
@@ -328,7 +336,7 @@ mod tests {
 
 	#[test]
 	fn grey_passes_through_unchanged() {
-		assert_eq!(convert_to_gray(GREY_FOURCC, &[10, 20, 30]), vec![10, 20, 30]);
+		assert_eq!(convert_to_gray(GREY_FOURCC, &[10, 20, 30], None), vec![10, 20, 30]);
 	}
 
 	#[test]

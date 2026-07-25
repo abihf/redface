@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use opencv::core::{AlgorithmHint, BORDER_REPLICATE, CV_8UC1, CV_32F, Mat, Ptr, Scalar, Size};
 use opencv::prelude::*;
-use opencv::{dnn, imgproc};
+use opencv::core;
+use opencv::imgproc;
 
 #[cfg(feature = "openvino")]
 use openvino::{CompiledModel, Core, DeviceType, ElementType, InferRequest, Model, PartialShape, Shape, Tensor};
@@ -128,10 +129,7 @@ enum ModelRunner {
 }
 
 impl ModelRunner {
-	/// Runs one forward pass on the NCHW f32 blob and returns the model's
-	/// output Mats in canonical branch order. On the ncnn backend the output
-	/// blob data is copied into Mats; on OpenVINO the tensor data is.
-	fn infer(&mut self, input: &Mat) -> Result<Vec<Mat>, RecognizerError> {
+	fn infer(&mut self, shape: [i32; 4], data: &[f32]) -> Result<Vec<Mat>, RecognizerError> {
 		match self {
 			#[cfg(feature = "openvino")]
 			Self::OpenVino {
@@ -140,21 +138,20 @@ impl ModelRunner {
 				num_outputs,
 				..
 			} => {
-				let dims = input.mat_size();
-				let shape: Vec<i64> = dims.iter().map(|&dim| i64::from(dim)).collect();
-				let tensor = input_tensor(&shape, input.data_typed::<f32>().map_err(inference_error)?)?;
+				let ov_shape: Vec<i64> = shape.iter().map(|&dim| i64::from(dim)).collect();
+				let tensor = input_tensor(&ov_shape, data)?;
 				request.set_tensor(input_name, &tensor).map_err(inference_error)?;
 				request.infer().map_err(inference_error)?;
 
 				let mut outputs = Vec::with_capacity(*num_outputs);
 				for index in 0..*num_outputs {
 					let output = request.get_output_tensor_by_index(index).map_err(inference_error)?;
-					let data = output.get_data::<f32>().map_err(inference_error)?;
-					let mut mat = Mat::new_rows_cols_with_default(1, data.len() as i32, CV_32F, Scalar::default())
+					let out_data = output.get_data::<f32>().map_err(inference_error)?;
+					let mut mat = Mat::new_rows_cols_with_default(1, out_data.len() as i32, CV_32F, Scalar::default())
 						.map_err(inference_error)?;
 					mat.data_typed_mut::<f32>()
 						.map_err(inference_error)?
-						.copy_from_slice(data);
+						.copy_from_slice(out_data);
 					outputs.push(mat);
 				}
 				Ok(outputs)
@@ -166,25 +163,12 @@ impl ModelRunner {
 				output_names,
 				detector,
 			} => {
-				let dims = input.mat_size();
-				let dims: &[i32] = &dims;
-				let [_, channels, height, width] = *dims else {
-					return Err(RecognizerError::Inference(format!(
-						"unexpected input blob dims {dims:?}"
-					)));
-				};
-				let data = input.data_typed::<f32>().map_err(inference_error)?;
-				let in_mat = ncnn::Mat::from_float_3d(width, height, channels, data).map_err(inference_error)?;
-				// All outputs are read from one extractor so the graph is
-				// evaluated once.
+				let [_, channels, height, width] = shape;
+				let in_mat =
+					ncnn::Mat::from_external_float_3d(width, height, channels, data).map_err(inference_error)?;
 				let mut extractor = net.create_extractor();
 				extractor.input(input_name, &in_mat).map_err(inference_error)?;
 
-				// Wrap each output blob in a 2D [entries, cols] Mat so the
-				// detector branches can be classified by shape, exactly as the
-				// old DNN path did. SCRFD/ArcFace outputs are 2D
-				// [entries, width]; a squeezed single-value branch may be 1D
-				// [entries] (width 1).
 				let mut mats = opencv::core::Vector::<Mat>::new();
 				for name in output_names {
 					let out = extractor.extract(name).map_err(inference_error)?;
@@ -229,6 +213,13 @@ pub struct Recognizer {
 	equalized: Mat,
 	rgb: Mat,
 	crop: Mat,
+	resized: Mat,
+	float_hwc: Mat,
+	blob_chw: Mat,
+	detection_indices: Vec<u32>,
+	detection_candidates: Vec<(Detection, f32)>,
+	detection_kept: Vec<(Detection, f32)>,
+	detection_results: Vec<Detection>,
 }
 
 impl Recognizer {
@@ -265,6 +256,13 @@ impl Recognizer {
 				equalized: Mat::default(),
 				rgb: Mat::default(),
 				crop: Mat::default(),
+				resized: Mat::default(),
+				float_hwc: Mat::default(),
+				blob_chw: Mat::default(),
+				detection_indices: Vec::new(),
+				detection_candidates: Vec::new(),
+				detection_kept: Vec::new(),
+				detection_results: Vec::new(),
 			})
 		}
 
@@ -287,6 +285,13 @@ impl Recognizer {
 				equalized: Mat::default(),
 				rgb: Mat::default(),
 				crop: Mat::default(),
+				resized: Mat::default(),
+				float_hwc: Mat::default(),
+				blob_chw: Mat::default(),
+				detection_indices: Vec::new(),
+				detection_candidates: Vec::new(),
+				detection_kept: Vec::new(),
+				detection_results: Vec::new(),
 			})
 		}
 	}
@@ -330,8 +335,16 @@ impl Recognizer {
 	}
 
 	fn detect(&mut self, width: usize, height: usize) -> Result<Vec<Detection>, RecognizerError> {
-		let blob = self.detector_input()?;
-		let branch_mats = self.detector.infer(&blob)?;
+		self.fill_detector_blob()?;
+		let shape = [1, 3, DETECTOR_INPUT_SIZE as i32, DETECTOR_INPUT_SIZE as i32];
+
+		let (blob_ptr, blob_len) = {
+			let blob = self.blob_chw.data_typed::<f32>().map_err(inference_error)?;
+			(blob.as_ptr(), blob.len())
+		};
+		let blob_data = unsafe { std::slice::from_raw_parts(blob_ptr, blob_len) };
+
+		let branch_mats = self.detector.infer(shape, blob_data)?;
 		if branch_mats.len() != 9 {
 			return Err(RecognizerError::Inference(format!(
 				"detector returned {} outputs, expected 9",
@@ -345,12 +358,34 @@ impl Recognizer {
 		}
 
 		let ratio = width as f32 / DETECTOR_INPUT_SIZE as f32;
-		Ok(decode_detections(&branches, ratio, width, height))
+		decode_detections(
+			&branches,
+			ratio,
+			width,
+			height,
+			&mut self.detection_indices,
+			&mut self.detection_candidates,
+		);
+		nms_reuse(
+			&mut self.detection_candidates,
+			DETECTOR_NMS_THRESHOLD,
+			&mut self.detection_kept,
+			&mut self.detection_results,
+		);
+		Ok(std::mem::take(&mut self.detection_results))
 	}
 
 	fn encode(&mut self, landmarks: &[(f32, f32); 5]) -> Result<Descriptor, RecognizerError> {
-		let crop = self.align_face(landmarks)?;
-		let outputs = self.encoder.infer(&crop)?;
+		self.fill_encoder_blob(landmarks)?;
+		let shape = [1, 3, ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32];
+
+		let (blob_ptr, blob_len) = {
+			let blob = self.blob_chw.data_typed::<f32>().map_err(inference_error)?;
+			(blob.as_ptr(), blob.len())
+		};
+		let blob_data = unsafe { std::slice::from_raw_parts(blob_ptr, blob_len) };
+
+		let outputs = self.encoder.infer(shape, blob_data)?;
 		let mat = outputs
 			.first()
 			.ok_or_else(|| RecognizerError::Inference("encoder returned no outputs".to_owned()))?;
@@ -372,24 +407,27 @@ impl Recognizer {
 	/// f32 normalized as (x - 127.5) / 128, per the SCRFD reference. OpenCV's
 	/// blob_from_image resizes with INTER_LINEAR (the InsightFace reference
 	/// preprocessing).
-	fn detector_input(&mut self) -> Result<Mat, RecognizerError> {
-		dnn::blob_from_image(
-			&self.rgb,
-			1.0 / 128.0,
-			Size::new(DETECTOR_INPUT_SIZE as i32, DETECTOR_INPUT_SIZE as i32),
-			Scalar::all(127.5),
-			false,
-			false,
-			CV_32F,
-		)
-		.map_err(inference_error)
+	fn fill_detector_blob(&mut self) -> Result<(), RecognizerError> {
+		let target = Size::new(DETECTOR_INPUT_SIZE as i32, DETECTOR_INPUT_SIZE as i32);
+		imgproc::resize(&self.rgb, &mut self.resized, target, 0.0, 0.0, imgproc::INTER_LINEAR)
+			.map_err(inference_error)?;
+		let alpha = 1.0 / 128.0;
+		let beta = -127.5 / 128.0;
+		self.resized
+			.convert_to(&mut self.float_hwc, CV_32F, alpha, beta)
+			.map_err(inference_error)?;
+		let hw = (DETECTOR_INPUT_SIZE * DETECTOR_INPUT_SIZE) as i32;
+		let reshaped = self.float_hwc.reshape(1, hw).map_err(inference_error)?;
+		core::transpose(&reshaped, &mut self.blob_chw).map_err(inference_error)?;
+		Ok(())
 	}
 
 	/// Warps the frame to an aligned ENCODER_INPUT_SIZE² face crop, returned as an
 	/// NCHW f32 blob Mat, BGR order, normalized (x - 127.5) / 127.5.
-	fn align_face(&mut self, landmarks: &[(f32, f32); 5]) -> Result<Mat, RecognizerError> {
+	fn fill_encoder_blob(&mut self, landmarks: &[(f32, f32); 5]) -> Result<(), RecognizerError> {
 		let m = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
-		let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).map_err(inference_error)?;
+		let matrix =
+			Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).map_err(inference_error)?;
 
 		let size = Size::new(ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32);
 		imgproc::warp_affine(
@@ -404,8 +442,15 @@ impl Recognizer {
 		)
 		.map_err(inference_error)?;
 
-		dnn::blob_from_image(&self.crop, 1.0 / 127.5, size, Scalar::all(127.5), true, false, CV_32F)
-			.map_err(inference_error)
+		let alpha = 1.0 / 127.5;
+		let beta = -1.0;
+		self.crop
+			.convert_to(&mut self.float_hwc, CV_32F, alpha, beta)
+			.map_err(inference_error)?;
+		let hw = (ENCODER_INPUT_SIZE * ENCODER_INPUT_SIZE) as i32;
+		let reshaped = self.float_hwc.reshape(1, hw).map_err(inference_error)?;
+		core::transpose(&reshaped, &mut self.blob_chw).map_err(inference_error)?;
+		Ok(())
 	}
 
 	/// Contrast-limited adaptive histogram equalization of a grayscale frame.
@@ -684,9 +729,16 @@ struct Detection {
 /// adjacent per point. `ratio` maps model-input pixels back to original frame
 /// pixels. Scores are pre-filtered with an AVX2 scan (scalar fallback), see
 /// `simd`. Returned detections are sorted by descending score.
-fn decode_detections(branches: &[&[f32]], ratio: f32, width: usize, height: usize) -> Vec<Detection> {
-	let mut candidates: Vec<(Detection, f32)> = Vec::new();
-	let mut indices = Vec::new();
+fn decode_detections(
+	branches: &[&[f32]],
+	ratio: f32,
+	width: usize,
+	height: usize,
+	indices: &mut Vec<u32>,
+	candidates: &mut Vec<(Detection, f32)>,
+) {
+	indices.clear();
+	candidates.clear();
 
 	for (level, stride) in STRIDES.iter().enumerate() {
 		let scores = branches[level];
@@ -694,7 +746,7 @@ fn decode_detections(branches: &[&[f32]], ratio: f32, width: usize, height: usiz
 		let kps = branches[6 + level];
 		let fmap = DETECTOR_INPUT_SIZE / stride;
 
-		simd::above_threshold(scores, DETECTOR_CONF_THRESHOLD, &mut indices);
+		simd::above_threshold(scores, DETECTOR_CONF_THRESHOLD, indices);
 		for index in indices.iter().copied() {
 			let index = index as usize;
 			let score = scores[index];
@@ -730,8 +782,6 @@ fn decode_detections(branches: &[&[f32]], ratio: f32, width: usize, height: usiz
 			));
 		}
 	}
-
-	nms(candidates, DETECTOR_NMS_THRESHOLD)
 }
 
 /// CLAHE tile grid (8x8) and clip limit, the OpenCV `cv::createCLAHE()`
@@ -751,10 +801,15 @@ fn clamp_coord(value: f32, limit: usize) -> i64 {
 /// Greedy NMS: sorts candidates by descending score, then keeps each box
 /// unless its IoU with an already-kept box exceeds `threshold`. The result
 /// stays sorted by descending score.
-fn nms(mut candidates: Vec<(Detection, f32)>, threshold: f32) -> Vec<Detection> {
+fn nms_reuse(
+	candidates: &mut Vec<(Detection, f32)>,
+	threshold: f32,
+	kept: &mut Vec<(Detection, f32)>,
+	results: &mut Vec<Detection>,
+) {
 	candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
-	let mut kept: Vec<(Detection, f32)> = Vec::with_capacity(candidates.len());
-	for candidate in candidates {
+	kept.clear();
+	for candidate in candidates.drain(..) {
 		let dominated = kept
 			.iter()
 			.any(|(existing, _)| iou(&existing.rectangle, &candidate.0.rectangle) > threshold);
@@ -762,7 +817,8 @@ fn nms(mut candidates: Vec<(Detection, f32)>, threshold: f32) -> Vec<Detection> 
 			kept.push(candidate);
 		}
 	}
-	kept.into_iter().map(|(detection, _)| detection).collect()
+	results.clear();
+	results.extend(kept.iter().map(|(det, _)| det.clone()));
 }
 
 fn iou(a: &Rectangle, b: &Rectangle) -> f32 {
@@ -831,6 +887,7 @@ fn similarity_transform(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> [f32; 6
 mod tests {
 	use super::*;
 	use opencv::core::{CV_8UC3, Vec3b};
+	use opencv::dnn;
 
 	/// Test helper: CLAHE + GRAY2RGB on a grayscale buffer, without a full
 	/// Recognizer (no models needed).
@@ -978,7 +1035,13 @@ mod tests {
 		];
 
 		let ratio = 0.5;
-		let detections = decode_detections(&branches, ratio, 320, 320);
+		let mut indices = Vec::new();
+		let mut candidates = Vec::new();
+		let mut kept = Vec::new();
+		let mut results = Vec::new();
+		decode_detections(&branches, ratio, 320, 320, &mut indices, &mut candidates);
+		nms_reuse(&mut candidates, DETECTOR_NMS_THRESHOLD, &mut kept, &mut results);
+		let detections = results;
 
 		assert_eq!(detections.len(), 1);
 		let det = &detections[0];
@@ -1003,7 +1066,7 @@ mod tests {
 			bottom: 100,
 		};
 		let landmarks = [(0.0, 0.0); 5];
-		let candidates = vec![
+		let mut candidates = vec![
 			(
 				Detection {
 					rectangle: rect(0),
@@ -1027,11 +1090,13 @@ mod tests {
 			),
 		];
 
-		let kept = nms(candidates, 0.4);
+		let mut kept = Vec::new();
+		let mut results = Vec::new();
+		nms_reuse(&mut candidates, 0.4, &mut kept, &mut results);
 
-		assert_eq!(kept.len(), 2);
-		assert_eq!(kept[0].rectangle.left, 0);
-		assert_eq!(kept[1].rectangle.left, 500);
+		assert_eq!(results.len(), 2);
+		assert_eq!(results[0].rectangle.left, 0);
+		assert_eq!(results[1].rectangle.left, 500);
 	}
 
 	#[test]
@@ -1058,7 +1123,13 @@ mod tests {
 			&scores, &empty16_s, &empty32_s, &bboxes, &empty16_b, &empty32_b, &kps, &empty16_k, &empty32_k,
 		];
 
-		let detections = decode_detections(&branches, 0.5, 320, 320);
+		let mut indices = Vec::new();
+		let mut candidates = Vec::new();
+		let mut kept = Vec::new();
+		let mut results = Vec::new();
+		decode_detections(&branches, 0.5, 320, 320, &mut indices, &mut candidates);
+		nms_reuse(&mut candidates, DETECTOR_NMS_THRESHOLD, &mut kept, &mut results);
+		let detections = results;
 
 		assert_eq!(detections.len(), 2);
 		// Zero bbox distances: degenerate box at the anchor center.

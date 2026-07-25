@@ -190,14 +190,40 @@ impl Mat {
 				actual: data.len(),
 			});
 		}
-		// SAFETY: a null allocator selects ncnn's default allocator; the
-		// returned mat owns a freshly allocated packed buffer of exactly
-		// `expected` f32, so the copy below stays in bounds.
 		let ptr = unsafe { ncnn_bind::ncnn_mat_create_3d(width, height, channels, std::ptr::null_mut()) };
 		unsafe {
 			std::slice::from_raw_parts_mut(ncnn_bind::ncnn_mat_get_data(ptr) as *mut f32, expected)
 				.copy_from_slice(data);
 		}
+		Ok(Self { ptr })
+	}
+
+	/// Wraps an existing NCHW f32 buffer in an ncnn mat without copying.
+	/// The data must outlive any extractor that takes this mat as input
+	/// (extractors clone internally, so the mat itself may be dropped after
+	/// `Extractor::input` returns). `data.len()` must equal `width * height *
+	/// channels`.
+	pub fn from_external_float_3d(width: i32, height: i32, channels: i32, data: &[f32]) -> Result<Self, Error> {
+		let expected = (width * height * channels) as usize;
+		if data.len() != expected {
+			return Err(Error::BufferLen {
+				expected,
+				actual: data.len(),
+			});
+		}
+		// SAFETY: ncnn_mat_create_external_3d marks the data as
+		// externally-owned (no internal free). The caller guarantees the
+		// pointer stays valid for the lifetime of any extractor that receives
+		// this mat.
+		let ptr = unsafe {
+			ncnn_bind::ncnn_mat_create_external_3d(
+				width,
+				height,
+				channels,
+				data.as_ptr() as *mut std::ffi::c_void,
+				std::ptr::null_mut(),
+			)
+		};
 		Ok(Self { ptr })
 	}
 
