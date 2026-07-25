@@ -198,6 +198,98 @@ Run it (plus `cargo test --workspace`) after any change to
   ncnn FFI `unsafe` may live; the EGL FFI in `redface-toolkit` is also `unsafe`
   but self-contained (~10 functions).
 
+## Performance & memory
+
+The two hot paths are the **recognition pipeline** (60 fps camera frames →
+detection → encoding) and the **UI render loop** (frame-callback-paced GL
+draws at native refresh). Both have been audited end-to-end; regressions in
+allocation volume or copy bandwidth must be avoided.
+
+### Recognition (redface-recognition, redface-runtime, redface-capture, ncnn)
+
+**Reuse, don't re-allocate.** The `Recognizer` struct holds reusable `Mat`
+buffers for every intermediate pixel stage in the hot path:
+
+- `equalized`, `rgb`, `crop` — reused `CV_8UC*` Mats for CLAHE output,
+  gray→RGB expansion, and warp-affine output.
+- `resized`, `float_hwc` — reused `CV_8UC3` and `CV_32FC3` intermediates for
+  the detector resize+normalize step.
+- `blob_chw` — reused `CV_32F` Mat for the HWC→CHW transpose (the final NCHW
+  blob fed to the inference backend).
+
+The old `dnn::blob_from_image` path allocated a fresh ~4.9 MB f32 Mat every
+frame for the detector (plus 150 KB for the encoder).  The replacement is:
+
+1. `imgproc::resize(rgb → resized, target_size, INTER_LINEAR)`
+2. `resized.convert_to(float_hwc, CV_32F, alpha, beta)` — normalizes in one
+   pass without an intermediate u8→f32 copy.
+3. `float_hwc.reshape(1, H*W)` (zero-copy header) → `core::transpose` into
+   `blob_chw` — the NCHW buffer, reused across frames.
+
+The final f32 data is passed to `ModelRunner::infer(shape: [i32; 4], data:
+&[f32])` — the old `infer(&Mat)` signature was replaced so input preparation
+lives in `Recognizer` (which owns the reusable buffers) and inference only
+sees a plain `&[f32]`.
+
+**ncnn zero-copy input.** `ncnn::Mat::from_external_float_3d` wraps the
+caller's f32 buffer (e.g. `blob_chw`'s data) without a memcpy, avoiding the
+old 4.9 MB copy into a freshly allocated ncnn Mat. The external Mat must
+outlive the last `Extractor::extract` call on that forward pass (the data
+lives in `blob_chw` which outlives the `infer` call, so this is trivially
+satisfied).
+
+**Frame buffer recycling.** `redface-capture` recycles the `Vec<u8>` frame
+buffer between the consumer thread and the producer thread via a
+`FrameSlot::recycle` field. The GREY pass-through path does
+`recycle_buffer.copy_from_slice(raw)` instead of `raw.to_vec()`, reusing the
+allocation frame-over-frame. The `stream()` callback now takes `&Frame`
+rather than `Frame` so the buffer stays owned by the capture loop for
+recycling.
+
+**Decode Vec reuse.** `Recognizer` owns `detection_indices: Vec<u32>`,
+`detection_candidates: Vec<(Detection, f32)>`, `detection_kept`, and
+`detection_results` — cleared per frame instead of allocated fresh.
+`decode_detections` and `nms_reuse` take `&mut Vec` parameters directly.
+
+### UI toolkit (redface-toolkit, redface-lock, redface-osd)
+
+**Cache GL uniform locations.** The old `render()` called
+`gl.get_uniform_location()` every frame for the bg and text passes (5 calls
+per frame — driver hash-table lookups). All uniform locations are now
+queried once at program-link time and stored in `Gpu` fields (same pattern
+the shape pass already used).
+
+**Avoid redundant scene rebuilds.** `build_scene()` allocates a fresh `Scene`
+with new `Vec`s for shapes and texts. This only happens on state changes
+(input, clock minute, resize, notification), not on pure animation frames
+(where the cached `Scene` is reused). When changing hover state, only
+trigger a redraw if the hit-test result actually changed (e.g. pointer
+motion within the same region should not rebuild the scene).
+
+**Reuse small Vecs in the UI.** `dot_births()` in redface-lock previously
+allocated a new `Vec<f32>` each call — replaced with a reusable
+`dot_births_cache` field on `UiState`, cleared and refilled. The lock's
+`build_scene` takes `&mut UiState` to support this.
+
+**Don't cache what the compositor owns.** `redface-osd`'s `Layout` is
+pre-computed once (the surface size is fixed) and stored as a field rather
+than recomputed on every pointer event. Layouts in `redface-lock` are
+recomputed per `build_scene` because the surface can resize.
+
+### Things to check when making changes
+
+- Every `Vec::new()` / `collect()` / `to_owned()` / `clone()` in a function
+  that runs per frame or per input event is suspect — can it be a reusable
+  field?
+- Every `dnn::blob_from_image` call in the recognition pipeline — can it be
+  replaced with the resize + convert_to + reshape + transpose pattern?
+- Every `ncnn::Mat::from_float_3d` call — can it use
+  `from_external_float_3d` instead?
+- Every `gl.get_uniform_location` in `render()` — cache it in `Gpu`.
+- Every `build_scene` call path — is the scene really dirty, or is it a
+  no-op state change (hover in same region, key press that doesn't change
+  visible state)?
+
 ## Runtime layout (deployed)
 
 - Config: `/etc/redface/config.json` (`device`, `inference_device`, `threshold`,
