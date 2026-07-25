@@ -25,6 +25,8 @@ use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, QueueHandle};
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1};
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1;
 
 use crate::gpu::{Gpu, GpuError, GpuSurface};
 use crate::scene::{Scene, Uniforms};
@@ -145,6 +147,8 @@ struct Runner {
 	surfaces: Vec<SurfaceEntry>,
 	keyboard: Option<wl_keyboard::WlKeyboard>,
 	pointer: Option<wl_pointer::WlPointer>,
+	cursor_shape_manager: Option<WpCursorShapeManagerV1>,
+	cursor_shape_device: Option<WpCursorShapeDeviceV1>,
 	last_minute: i32,
 }
 
@@ -533,6 +537,11 @@ impl SeatHandler for Runner {
 		}
 		if capability == Capability::Pointer && self.pointer.is_none() {
 			self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+			if let (Some(manager), Some(pointer)) = (&self.cursor_shape_manager, &self.pointer) {
+				let device = manager.get_pointer(pointer, qh, ());
+				log::debug!("tk: cursor shape device created");
+				self.cursor_shape_device = Some(device);
+			}
 		}
 	}
 
@@ -628,6 +637,15 @@ impl PointerHandler for Runner {
 			if self.surface_index(&event.surface).is_none() {
 				continue;
 			}
+			if matches!(event.kind, PointerEventKind::Enter { .. })
+				&& let Some(device) = &self.cursor_shape_device
+			{
+				let serial = match event.kind {
+					PointerEventKind::Enter { serial } => serial,
+					_ => unreachable!(),
+				};
+				device.set_shape(serial, Shape::Default);
+			}
 			self.app.on_pointer(event.kind.clone(), event.position);
 			handled = true;
 		}
@@ -649,6 +667,8 @@ impl ProvidesRegistryState for Runner {
 smithay_client_toolkit::delegate_dispatch2!(Runner);
 wayland_client::delegate_noop!(Runner: ignore WpViewporter);
 wayland_client::delegate_noop!(Runner: ignore WpViewport);
+wayland_client::delegate_noop!(Runner: ignore WpCursorShapeManagerV1);
+wayland_client::delegate_noop!(Runner: ignore WpCursorShapeDeviceV1);
 
 /// Runs the event loop until the app exits. GLES is a hard requirement.
 pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
@@ -664,6 +684,7 @@ pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
 
 	let compositor = CompositorState::bind(&globals, &qh)?;
 	let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+	let cursor_shape_manager: Option<WpCursorShapeManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
 	let (session_lock_state, layer_shell, layer_config) = match config.role {
 		Role::SessionLock => (Some(SessionLockState::new(&globals, &qh)), None, None),
 		Role::Layer(layer_config) => (None, Some(LayerShell::bind(&globals, &qh)?), Some(layer_config)),
@@ -697,6 +718,8 @@ pub fn run(config: RunConfig, app: &mut dyn App) -> Result<(), Box<dyn Error>> {
 		surfaces: Vec::new(),
 		keyboard: None,
 		pointer: None,
+		cursor_shape_manager,
+		cursor_shape_device: None,
 		last_minute: -1,
 	};
 

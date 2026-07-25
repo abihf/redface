@@ -7,6 +7,7 @@ edition = "2024"
 glow = "0.18"
 smithay-client-toolkit = "0.21"
 wayland-client = { version = "0.31", features = ["system"] }
+wayland-protocols = "0.32"
 bytemuck = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
 fontdb = "0.23"

@@ -1125,6 +1125,7 @@ dependencies = [
  "log",
  "smithay-client-toolkit",
  "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
