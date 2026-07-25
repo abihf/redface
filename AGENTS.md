@@ -181,6 +181,8 @@ Run it (plus `cargo test --workspace`) after any change to
 - Rust edition 2024. Keep changes minimal and match surrounding style; the
   codebase favors small free functions, explicit error enums with
   `fmt::Display` + `std::error::Error`, and `#[cfg(test)] mod tests` per file.
+- Run `cargo fmt` after every code change. The workspace is formatted with
+  rustfmt; unformatted code breaks CI and makes diffs noisy.
 - Tests must be self-contained: no fixture files, no camera, no models, no
   network. (Descriptor tests generate their data deterministically in code.)
   Tests that need the real models live in `examples/`, not `tests/`.
