@@ -2,10 +2,10 @@ use std::ffi::c_void;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use opencv::core::{AlgorithmHint, BORDER_REPLICATE, CV_8UC1, CV_32F, Mat, Ptr, Scalar, Size};
-use opencv::prelude::*;
 use opencv::core;
+use opencv::core::{AlgorithmHint, BORDER_REPLICATE, CV_8UC1, CV_32F, Mat, Ptr, Scalar, Size};
 use opencv::imgproc;
+use opencv::prelude::*;
 
 #[cfg(feature = "openvino")]
 use openvino::{CompiledModel, Core, DeviceType, ElementType, InferRequest, Model, PartialShape, Shape, Tensor};
@@ -426,8 +426,7 @@ impl Recognizer {
 	/// NCHW f32 blob Mat, BGR order, normalized (x - 127.5) / 127.5.
 	fn fill_encoder_blob(&mut self, landmarks: &[(f32, f32); 5]) -> Result<(), RecognizerError> {
 		let m = similarity_transform(landmarks, &ARCFACE_TEMPLATE);
-		let matrix =
-			Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).map_err(inference_error)?;
+		let matrix = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).map_err(inference_error)?;
 
 		let size = Size::new(ENCODER_INPUT_SIZE as i32, ENCODER_INPUT_SIZE as i32);
 		imgproc::warp_affine(

@@ -123,7 +123,8 @@ impl UiState {
 	pub fn dot_births(&mut self, epoch: Instant) -> &[f32] {
 		self.dot_births_cache.clear();
 		for (_, t) in &self.password {
-			self.dot_births_cache.push(t.saturating_duration_since(epoch).as_secs_f32());
+			self.dot_births_cache
+				.push(t.saturating_duration_since(epoch).as_secs_f32());
 		}
 		&self.dot_births_cache
 	}

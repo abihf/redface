@@ -633,11 +633,7 @@ impl GpuSurface {
 				uniforms.surface_size[0],
 				uniforms.surface_size[1],
 			);
-			gl.uniform_2_f32(
-				Some(&gpu.bg_u_bg_image_size),
-				gpu.bg_size[0],
-				gpu.bg_size[1],
-			);
+			gl.uniform_2_f32(Some(&gpu.bg_u_bg_image_size), gpu.bg_size[0], gpu.bg_size[1]);
 			gl.draw_arrays(glow::TRIANGLES, 0, 3);
 
 			// --- Shape pass ---
