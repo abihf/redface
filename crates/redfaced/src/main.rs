@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct App {
 	recognizer: Recognizer,
 	config: Config,
-	pid_guard: PidFileGuard,
+	_pid_guard: PidFileGuard,
 }
 
 impl App {
@@ -43,7 +43,7 @@ impl App {
 		Ok(Self {
 			recognizer,
 			config,
-			pid_guard,
+			_pid_guard: pid_guard,
 		})
 	}
 
