@@ -78,26 +78,26 @@ $(TARGET_DIR)/redface-osd: $(RUSTFILES)
 
 install: install-pam install-daemon install-check install-record install-lock install-osd install-data
 
-install-pam: pam
+install-pam:
 	install $(TARGET_DIR)/libpam_redface.so $(DESTDIR)$(PAMDIR)/pam_redface.so
 
-install-daemon: daemon
+install-daemon:
 	install $(TARGET_DIR)/redfaced $(DESTDIR)$(BINDIR)/redfaced
 
 install-unit:
 	install data/redfaced.service $(DESTDIR)$(LIBDIR)/systemd/system/redfaced.service
 
-install-check: check
+install-check:
 	install $(TARGET_DIR)/redface-check $(DESTDIR)$(BINDIR)/redface-check
 
-install-record: record
+install-record:
 	install $(TARGET_DIR)/redface-record $(DESTDIR)$(BINDIR)/redface-record
 
-install-lock: lock
+install-lock:
 	install $(TARGET_DIR)/redface-lock $(DESTDIR)$(BINDIR)/redface-lock
 	install -m 644 data/redface-lock.pam $(DESTDIR)/etc/pam.d/redface-lock
 
-install-osd: osd
+install-osd:
 	install $(TARGET_DIR)/redface-osd $(DESTDIR)$(BINDIR)/redface-osd
 
 install-osd-unit:
