@@ -25,9 +25,7 @@ where
 		let len = u16::from_le_bytes(len) as usize;
 		let mut buf = vec![0u8; len];
 		reader.read_exact(&mut buf)?;
-		let archived = rkyv::access::<Self::Archived, rancor::Error>(&buf)
-			.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-		rkyv::deserialize(archived).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+		rkyv::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 	}
 }
 
