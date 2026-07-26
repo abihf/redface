@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -17,11 +17,10 @@ use redface_core::{
 };
 use redface_recognition::Recognizer;
 use redface_runtime::{VerifyOptions, verify};
-use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	env_logger::init();
-	let mut app = App::new()?;
+	let app = App::new()?;
 	app.run()?;
 	Ok(())
 }
@@ -47,19 +46,15 @@ impl App {
 		})
 	}
 
-	fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+	fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
 		let socket_path = PathBuf::from(&self.config.socket);
 		let _ = fs::remove_file(&socket_path);
 		let listener = UnixListener::bind(&socket_path)?;
 		fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666))?;
-		listener.set_nonblocking(true)?;
 
-		let stop = Arc::new(AtomicBool::new(false));
-		signal_hook::flag::register(SIGINT, stop.clone())?;
-		signal_hook::flag::register(SIGTERM, stop.clone())?;
 		let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
-		while !stop.load(Ordering::Relaxed) {
+		loop {
 			match listener.accept() {
 				Ok((mut conn, _)) => {
 					if let Err(err) = self.handle_connection(&mut conn) {
@@ -67,13 +62,9 @@ impl App {
 					}
 					let _ = conn.shutdown(Shutdown::Both);
 				}
-				Err(err) if err.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(100)),
 				Err(err) => return Err(Box::new(err)),
 			}
 		}
-
-		let _ = fs::remove_file(&socket_path);
-		Ok(())
 	}
 
 	fn handle_connection(&mut self, conn: &mut UnixStream) -> Result<(), Box<dyn std::error::Error>> {
