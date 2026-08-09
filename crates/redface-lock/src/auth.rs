@@ -187,7 +187,7 @@ fn run(conn: &mut UnixStream, uid: u32) -> Result<(), String> {
 	DaemonRequest::Authenticate {
 		client: "lock".into(),
 		user: uid.to_string(),
-		timeout: None,
+		timeout: Some(-1),
 		show_osd: false,
 	}
 	.write_to(&mut *conn)
