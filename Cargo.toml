@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/redface-core", "crates/redface-recognition", "crates/ncnn", "crates/ncnn-bind", "crates/redface-record", "crates/redface-capture", "crates/redface-runtime", "crates/redfaced", "crates/redface-check", "crates/redface-toolkit", "crates/redface-lock", "crates/redface-osd", "crates/pam-redface"]
+members = ["crates/redface-core", "crates/redface-recognition", "crates/redface-record", "crates/redface-capture", "crates/redface-runtime", "crates/redfaced", "crates/redface-check", "crates/redface-toolkit", "crates/redface-lock", "crates/redface-osd", "crates/pam-redface"]
+# ncnn and ncnn-bind are not workspace members: they are only pulled into the
+# build graph as path dependencies when redface-recognition's `ncnn` feature is
+# on (the default). Excluding them means workspace-wide OpenVINO builds
+# (`cargo build --workspace --no-default-features --features openvino`) don't
+# compile them or link libncnn.
+exclude = ["crates/ncnn", "crates/ncnn-bind"]
 resolver = "3"
 
 [workspace.dependencies]
