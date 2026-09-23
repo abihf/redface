@@ -85,6 +85,9 @@ pub fn verify(
 				timed_out = true;
 				return StreamAction::Stop;
 			}
+			if frame.is_black() {
+				return StreamAction::Continue;
+			}
 
 			// Throttle Verifying to ~2 Hz (every 30 frames at 60 fps).
 			if frame_count % 30 == 0 {

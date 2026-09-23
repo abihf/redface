@@ -29,6 +29,12 @@ pub struct Frame {
 	pub height: u32,
 }
 
+impl Frame {
+	pub fn is_black(&self) -> bool {
+		is_black_frame(&self.buffer)
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamAction {
 	Continue,
@@ -166,15 +172,13 @@ impl Camera {
 
 				{
 					let mut slot = lock.lock().unwrap();
+					if slot.stop {
+						return;
+					}
 					if slot.frame.is_some() {
 						slot.stats.dropped_frames += 1;
 						continue;
 					}
-				}
-
-				if fourcc == GREY_FOURCC && is_black_frame(raw) {
-					lock.lock().unwrap().stats.dropped_frames += 1;
-					continue;
 				}
 
 				let recycle = lock.lock().unwrap().recycle.take();

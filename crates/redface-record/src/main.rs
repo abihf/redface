@@ -30,6 +30,9 @@ fn main_impl() -> Result<(), Box<dyn std::error::Error>> {
 	let mut session = RecordSession::new();
 
 	let stats = camera.stream(|frame| {
+		if frame.is_black() {
+			return StreamAction::Continue;
+		}
 		let faces = match recognizer.recognize(&frame.buffer, frame.width, frame.height, 1) {
 			Ok(faces) => faces,
 			Err(err) => {

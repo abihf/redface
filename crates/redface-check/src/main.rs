@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let req = DaemonRequest::Authenticate {
 		client: "check".into(),
 		user: uid.to_string(),
-		timeout: Some(-1),
+		timeout: None,
 		show_osd: true,
 	};
 	req.write_to(&mut conn)?;
