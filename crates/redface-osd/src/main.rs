@@ -31,6 +31,8 @@ struct OsdApp {
 	osd_conn: UnixStream,
 	/// Last notification received from the daemon.
 	notification: OSDNotification,
+	/// Whether authentication succeeded during this session.
+	success: bool,
 	/// When `Stopped` was received; the UI stays visible for 3 more seconds.
 	stopped_at: Option<Instant>,
 	/// True after the user clicked Cancel (we sent Cancelling and are waiting
@@ -52,6 +54,7 @@ impl OsdApp {
 		Self {
 			osd_conn,
 			notification: OSDNotification::Verifying,
+			success: false,
 			stopped_at: None,
 			cancelled_by_user: false,
 			hover_cancel: false,
@@ -63,6 +66,7 @@ impl OsdApp {
 	}
 
 	fn apply_notification(&mut self, notif: OSDNotification) {
+		self.success |= matches!(notif, OSDNotification::Success);
 		self.face_color = match notif {
 			OSDNotification::Verifying => ui::ACCENT_COLOR,
 			OSDNotification::Success => ui::SUCCESS_COLOR,
@@ -141,6 +145,8 @@ impl App for OsdApp {
 			} else {
 				self.send_cancel();
 			}
+		} else if (event.keysym == Keysym::Return || event.keysym == Keysym::KP_Enter) && self.success {
+			self.dismiss();
 		}
 	}
 
